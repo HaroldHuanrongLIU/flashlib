@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashlib"
+version = "0.1.0"
+description = "High-performance ML primitives, applications, and informative cost API — Triton kernels for NVIDIA GPUs."
+requires-python = ">=3.9"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "flashlib authors"},
+]
+keywords = ["triton", "gpu", "machine-learning", "kmeans", "knn", "pca", "dbscan", "cuml"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "torch>=2.0",
+    "triton>=3.6",
+    "numpy",
+    "numba",                # hdbscan tree-condensation helpers (CPU-side)
+    "nvidia-cutlass-dsl",   # CuteDSL backends for kmeans/knn/dbscan/hdbscan/umap/spectral_clustering/polar/orthonormalize
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "scikit-learn>=1.5,<1.8", "tqdm"]
+bench = [
+    "scikit-learn>=1.5,<1.8",
+    "tqdm",
+    "matplotlib",
+    # vs-cuML comparison benchmarks (optional, RAPIDS wheels from pypi.nvidia.com):
+    #   pip install --extra-index-url https://pypi.nvidia.com cuml-cu13 cudf-cu13 cupy-cuda13x
+    # See benchmarks/vs_cuml/README.md for the supported version matrix.
+]
+
+[project.urls]
+Homepage = "https://flashml-org.github.io/"
+Repository = "https://github.com/FlashML-org/flashlib"
+
+[tool.setuptools.packages.find]
+include = ["flashlib*"]

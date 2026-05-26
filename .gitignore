@@ -1,0 +1,70 @@
+# ── Python bytecode / build artifacts ────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+wheels/
+*.egg
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ── Test / type / lint caches ────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ── Triton / CUDA / cuTeDSL JIT caches ───────────────────────────────
+.triton/
+# Per-primitive TRITON_CACHE_DIR populated by
+# benchmarks/vs_cuml/heavy/run_all_parallel.py — its _run_one() sets
+# TRITON_CACHE_DIR=<repo>/.triton_cache/<prim> per subprocess so each
+# primitive's autotune state is isolated.
+.triton_cache/
+.cute_dsl/
+.nv_cache/
+.cuda_cache/
+
+# ── Notebooks ────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Editors / OS ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Tuner artifacts (machine-local) ──────────────────────────────────
+# Per-device JSONL grids written by `python -m benchmarks.tune.<op>`.
+# The hand-written rules in `flashlib/.../<op>/route.py` are committed;
+# the raw measurements are not.
+benchmarks/tune/results/*
+!benchmarks/tune/results/.gitkeep
+
+# ── Benchmark results (regenerated locally by the user) ──────────────
+# Every script under benchmarks/ writes to benchmarks/results/. The
+# results are machine + version specific and meant to be reproduced
+# locally — they are not committed. Re-run e.g.:
+#   python -m benchmarks.vs_cuml.heavy.run_all_parallel --gpus 8
+#   python -m benchmarks.vs_cuml.broad.run_all --gpus 8
+#   python -m benchmarks.micro.bench_<name>
+benchmarks/results/
+
+# ── Local-only ───────────────────────────────────────────────────────
+*.log
+.env
+.env.local
