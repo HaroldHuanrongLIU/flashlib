@@ -51,7 +51,6 @@ est = info.estimate("kmeans",
                     params={"K": 256, "max_iters": 20},
                     device="H200")
 print(est.summary_line())
-# kmeans_triton  2.00 ms  bound=latency  (64% peak)  [calibrated]
 ```
 
 See the blog post for the full API, the tolerance-driven dispatch, and
