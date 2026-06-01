@@ -83,6 +83,14 @@ _DEFAULT_EFFICIENCY: dict[str, float] = {
     "topk":         0.45,
     "spmv":         0.70,  # sparse: HBM-bound, near-elementwise
     "rng":          0.60,  # streaming PRNG kernels
+    # IVF-Flat fine-scan: online path streams cell-contiguous candidates
+    # from HBM with an on-chip top-K epilogue -> bandwidth-bound; batch path
+    # groups queries per list into a tensor-core GEMM (read reuse) ->
+    # WGMMA-bound. Build reuses the kmeans op-class; "ivf_flat" is the
+    # dispatcher-level default.
+    "ivf_flat":         0.55,
+    "ivf_flat_search":  0.60,  # coalesced list reads, top-K epilogue derate
+    "ivf_flat_build":   0.45,  # dominated by the kmeans assign pass
 }
 
 
@@ -133,6 +141,12 @@ _SUSTAINED_TFLOPS: dict[tuple[str, str, str], float] = {
     ("knn_build",  "fp32", "H200"): 260.0,
     ("knn_search", "bf16", "H200"):  80.0,
     ("knn_search", "fp32", "H200"):  40.0,
+    # ─── IVF-Flat fused fine-scan ─────────────────────────────────────────
+    # The online path is bandwidth-bound (the ``_SUSTAINED_BW_TBS`` entry
+    # below dominates the estimate); these compute numbers track the
+    # analogous knn_search regime and matter only for the batch GEMM path.
+    ("ivf_flat_search", "bf16", "H200"): 90.0,
+    ("ivf_flat_search", "fp32", "H200"): 45.0,
 }
 
 
@@ -161,6 +175,17 @@ _SUSTAINED_BW_TBS: dict[tuple[str, str], float] = {
     ("knn_build",   "H100"): 1.0,
     ("knn_search",  "H200"): 2.8,   # search is more bw-limited (low D, low N)
     ("knn_search",  "H100"): 1.9,
+    # IVF-Flat fine-scan has two regimes. ONLINE (tiny nq, elementwise
+    # kernel): bandwidth-bound coalesced list reads + per-(query,probe)
+    # top-K epilogue, ~0.6-1.0 TB/s on H200. BATCH (large nq, group-by-list
+    # tensor-core GEMM): each list's vectors are read once from HBM and
+    # reused across all queries probing it, so *effective* candidate-read
+    # bandwidth measured via benchmarks/vs_cuml/ivf_flat.py is 16-31 TB/s --
+    # far above HBM peak (~4.8 TB/s) because it is no longer HBM-bound but
+    # WGMMA-bound. We keep the conservative online BW here (lower bound for
+    # batch); H100 scaled by the HBM-peak ratio (3.1/4.8).
+    ("ivf_flat_search", "H200"): 1.0,
+    ("ivf_flat_search", "H100"): 0.7,
 }
 
 

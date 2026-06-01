@@ -54,6 +54,11 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "flash_knn_triton":           ("flashlib.primitives.knn", "flash_knn_triton"),
     "flash_knn_cutedsl":          ("flashlib.primitives.knn", "cutedsl_flash_knn"),
     "flash_knn_dispatch":         ("flashlib.primitives.knn", "flash_knn_dispatch"),
+    # ivf-flat -- GPU ANN (inverted file); build once, search many.
+    "flash_ivf_flat":             ("flashlib.primitives.ivf_flat", "flash_ivf_flat"),
+    "flash_ivf_flat_build":       ("flashlib.primitives.ivf_flat", "flash_ivf_flat_build"),
+    "flash_ivf_flat_search":      ("flashlib.primitives.ivf_flat", "flash_ivf_flat_search"),
+    "IvfFlatIndex":               ("flashlib.primitives.ivf_flat", "IvfFlatIndex"),
     # decomposition
     "flash_pca":                 ("flashlib.primitives.pca", "flash_pca"),
     "flash_pca_cutedsl":         ("flashlib.primitives.pca", "flash_pca_cutedsl"),
@@ -103,6 +108,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "KMeans":            ("flashlib.applications", "KMeans"),
     "FlashKMeans":       ("flashlib.applications", "FlashKMeans"),
     "NearestNeighbors":  ("flashlib.applications", "NearestNeighbors"),
+    "IVFFlat":           ("flashlib.applications", "IVFFlat"),
     "PCA":               ("flashlib.applications", "PCA"),
     "StandardScaler":    ("flashlib.applications", "StandardScaler"),
     "DBSCAN":            ("flashlib.applications", "DBSCAN"),

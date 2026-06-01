@@ -1,8 +1,8 @@
 # FlashLib
 
 A GPU library for classical machine-learning operators — `kmeans`, `knn`,
-`pca`, `svd`, `dbscan`, `hdbscan`, `umap`, `t-sne`, regression, GEMM, and
-more — built on Triton and CuteDSL.
+`ivf-flat`, `pca`, `svd`, `dbscan`, `hdbscan`, `umap`, `t-sne`, regression,
+GEMM, and more — built on Triton and CuteDSL.
 
 See [the blog post](https://flashml-org.github.io/) for motivation, design,
 and benchmarks.
@@ -36,6 +36,24 @@ labels, centroids, n_iter = flash_kmeans(x, n_clusters=1024, max_iters=20)
 Every primitive is exposed as a top-level `flash_*` function and as a
 sklearn-style class (`KMeans`, `PCA`, `HDBSCAN`, …).
 
+Index-based primitives like IVF-Flat (GPU approximate nearest neighbours)
+build an index once and query it many times:
+
+```python
+import torch
+from flashlib import IVFFlat
+
+db = torch.randn(1_000_000, 128, device="cuda")
+queries = torch.randn(10_000, 128, device="cuda")
+
+index = IVFFlat(nlist=1024, nprobe=16).fit(db)
+distances, indices = index.kneighbors(queries, n_neighbors=10)  # squared L2
+```
+
+`nprobe` is the recall knob: at a fixed `(nlist, nprobe)` the probed
+candidate set — and thus recall — matches a reference IVF-Flat (FAISS /
+cuVS), so raising it trades speed for recall without changing the kernel.
+
 ### Informative API
 
 The `flashlib.info` submodule predicts runtime, FLOPs, and HBM bytes for any
@@ -58,12 +76,12 @@ per-primitive benchmarks.
 
 ## Coverage
 
-The current release ships **15 high-level primitives** across the following families:
+The current release ships **16 high-level primitives** across the following families:
 
 | family         | primitives                                                                       |
 | -------------- | -------------------------------------------------------------------------------- |
 | Clustering     | `flash_kmeans`, `flash_dbscan`, `flash_hdbscan`, `flash_spectral_clustering`     |
-| Nearest nbrs   | `flash_knn`                                                                      |
+| Nearest nbrs   | `flash_knn`, `flash_ivf_flat` (IVF-Flat ANN)                                     |
 | Decomposition  | `flash_pca`, `flash_truncated_svd`                                               |
 | Manifold       | `flash_umap`, `flash_tsne`                                                       |
 | Regression     | `flash_linear_regression`, `flash_ridge`, `flash_logistic_regression`            |

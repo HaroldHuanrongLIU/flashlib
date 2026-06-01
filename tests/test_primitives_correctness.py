@@ -76,6 +76,139 @@ def test_knn_matches_naive_topk():
     assert same > 0.99, f"only {same:.2%} of nearest-neighbors agree"
 
 
+def _blobs(M, D, n_centers, device, seed=0, scale=4.0, spread=1.0):
+    g = torch.Generator(device=device).manual_seed(seed)
+    centers = torch.randn(n_centers, D, generator=g, device=device) * scale
+    lab = torch.randint(0, n_centers, (M,), generator=g, device=device)
+    X = centers[lab] + torch.randn(M, D, generator=g, device=device) * spread
+    return X.to(torch.float32).contiguous()
+
+
+def _recall(got_ids, ref_ids):
+    k = ref_ids.shape[1]
+    hits = sum(
+        len(set(got_ids[i].tolist()) & set(ref_ids[i].tolist()))
+        for i in range(got_ids.shape[0])
+    )
+    return hits / (got_ids.shape[0] * k)
+
+
+@cuda_only
+def test_ivf_flat_recall_vs_brute():
+    """nprobe==nlist must reproduce brute force; moderate nprobe clears 0.95.
+
+    At ``nprobe == nlist`` every list is probed, so the candidate set is the
+    whole database and the fused fine-scan must return the exact top-k
+    distances (modulo fp tie-breaking at the k boundary). Recall then climbs
+    monotonically with nprobe, the only recall knob.
+    """
+    from flashlib import flash_ivf_flat_build, flash_ivf_flat_search
+
+    torch.manual_seed(0)
+    M, D, nlist, k = 20_000, 64, 128, 10
+    X = _blobs(M, D, 16, "cuda", seed=0)
+    Q = _blobs(256, D, 16, "cuda", seed=1)
+
+    index = flash_ivf_flat_build(X, nlist, nprobe=8, niter=15, seed=0)
+
+    ref = torch.cdist(Q, X) ** 2
+    ref_vals, ref_ids = ref.topk(k, largest=False, dim=1)
+
+    # Exhaustive: probe every list -> exact distances.
+    vals_all, ids_all = flash_ivf_flat_search(index, Q, k, nprobe=nlist)
+    assert torch.allclose(
+        vals_all.sort(1).values, ref_vals.sort(1).values, rtol=1e-3, atol=1e-1
+    ), "nprobe==nlist distances must equal brute force"
+    assert _recall(ids_all, ref_ids) >= 0.99
+
+    # Moderate nprobe still clears a high recall bar on blob data.
+    _, ids_mod = flash_ivf_flat_search(index, Q, k, nprobe=nlist // 4)
+    assert _recall(ids_mod, ref_ids) >= 0.95
+
+    # Recall is monotonic in nprobe (more probes never hurts).
+    r_lo = _recall(flash_ivf_flat_search(index, Q, k, nprobe=2)[1], ref_ids)
+    r_hi = _recall(flash_ivf_flat_search(index, Q, k, nprobe=16)[1], ref_ids)
+    assert r_hi >= r_lo
+
+
+@cuda_only
+def test_ivf_flat_isorecall_vs_reference():
+    """Triton kernel == pure-torch reference on the SAME index (iso-recall).
+
+    Building once and running both the fused Triton search and the torch
+    oracle over the identical centroids/assignments must return identical
+    neighbour ids at matched ``nprobe`` -- so any divergence is a kernel
+    bug, not an algorithmic difference.
+    """
+    from flashlib import flash_ivf_flat_build, flash_ivf_flat_search
+    from flashlib.primitives.ivf_flat import torch_fallback as tf
+
+    torch.manual_seed(0)
+    M, D, nlist, k = 12_000, 48, 64, 8
+    X = _blobs(M, D, 10, "cuda", seed=2)
+    Q = _blobs(128, D, 10, "cuda", seed=3)
+
+    index = flash_ivf_flat_build(X, nlist, nprobe=8, niter=15, seed=0)
+
+    for nprobe in (4, 8, 16):
+        gv, gi = flash_ivf_flat_search(index, Q, k, nprobe=nprobe)
+        tv, ti = tf.ivf_flat_search_torch(index, Q, k, nprobe=nprobe)
+        # Same candidate set scanned, same exact distances found; compare on
+        # the distance values, which are robust to k-boundary ties.
+        assert torch.allclose(
+            gv.sort(1).values, tv.sort(1).values, rtol=1e-3, atol=1e-2
+        ), f"distance sets diverge at nprobe={nprobe}"
+        # IDs then match too, save for the rare fp tie at the k-th boundary
+        # (two candidates equidistant to within fp32 accumulation order).
+        same = (gi.sort(1).values == ti.sort(1).values).float().mean().item()
+        assert same >= 0.99, f"iso-recall id mismatch at nprobe={nprobe}: {same:.4f}"
+
+
+@cuda_only
+def test_ivf_flat_application_class():
+    """The sklearn-style IVFFlat wrapper round-trips fit -> kneighbors."""
+    from flashlib import IVFFlat
+
+    torch.manual_seed(0)
+    X = _blobs(8_000, 32, 8, "cuda", seed=4)
+    Q = _blobs(64, 32, 8, "cuda", seed=5)
+    model = IVFFlat(nlist=64, nprobe=32, n_neighbors=10, niter=10, seed=0).fit(X)
+    dist, idx = model.kneighbors(Q)
+    assert dist.shape == (64, 10) and idx.shape == (64, 10)
+
+    ref = torch.cdist(Q, X) ** 2
+    _, ref_ids = ref.topk(10, largest=False, dim=1)
+    assert _recall(idx, ref_ids) >= 0.95
+
+
+@cuda_only
+def test_ivf_flat_gemm_matches_elementwise_high_d():
+    """GEMM and elementwise fine-scan agree at D>256 (D-split path).
+
+    D>256 drives the GEMM kernel through its D-split branch (re-gather the
+    query tile per corpus chunk) followed by an oversampled exact re-rank.
+    Both variants scan the same candidate set, so their returned squared-L2
+    distances must match each other and stay at brute-force recall.
+    """
+    from flashlib import flash_ivf_flat_build, flash_ivf_flat_search
+
+    torch.manual_seed(0)
+    M, D, nlist, k = 12_000, 320, 64, 10
+    X = _blobs(M, D, 12, "cuda", seed=6)
+    Q = _blobs(512, D, 12, "cuda", seed=7)
+    index = flash_ivf_flat_build(X, nlist, nprobe=8, niter=12, seed=0)
+
+    gv, gi = flash_ivf_flat_search(index, Q, k, nprobe=16, variant="gemm")
+    ev, _ = flash_ivf_flat_search(index, Q, k, nprobe=16, variant="elementwise")
+    assert torch.allclose(
+        gv.sort(1).values, ev.sort(1).values, rtol=1e-3, atol=1e-1
+    ), "gemm (D-split) vs elementwise distances diverge at D>256"
+
+    ref = torch.cdist(Q, X) ** 2
+    _, ref_ids = ref.topk(k, largest=False, dim=1)
+    assert _recall(gi, ref_ids) >= 0.95
+
+
 @cuda_only
 def test_dbscan_recovers_blobs():
     from flashlib import flash_dbscan
