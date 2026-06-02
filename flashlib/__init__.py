@@ -104,6 +104,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "pairwise_l2":               ("flashlib.kernels.distance", "pairwise_l2"),
     "pairwise_l2sq":             ("flashlib.kernels.distance", "pairwise_l2sq"),
     "connected_components":      ("flashlib.kernels.connected_components", "connected_components"),
+    "flash_rmsnorm":             ("flashlib.kernels.norm", "flash_rmsnorm"),
+    "flash_layernorm":           ("flashlib.kernels.norm", "flash_layernorm"),
     # === applications ===
     "KMeans":            ("flashlib.applications", "KMeans"),
     "FlashKMeans":       ("flashlib.applications", "FlashKMeans"),
