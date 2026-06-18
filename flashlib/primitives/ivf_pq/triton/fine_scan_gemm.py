@@ -301,6 +301,7 @@ def ivf_pq_fine_scan_gemm(
     over: int = 2,
     BN: int = 64,
     BM: int = 64,
+    num_stages: int = 2,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Cluster-centric decode+GEMM fine scan, then exact ADC re-rank.
 
@@ -366,7 +367,7 @@ def ivf_pq_fine_scan_gemm(
         MSUB=m, DSUB=dsub, DP=Dp, D_INNER=D_INNER,
         BN=BN, BM=BM,
         TOPK_PAD=TOPK_PAD, MAX_STEPS=MAX_STEPS,
-        num_warps=4,
+        num_warps=4, num_stages=num_stages,
     )
 
     # ── scatter partials to per-query order, merge nprobe partials ─────

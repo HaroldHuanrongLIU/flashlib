@@ -102,6 +102,7 @@ _ANN_DATASETS = {
     # name -> (url, metric). HDF5 layout: train (N,D), test (nq,D),
     # neighbors (nq,100) exact top-100 ids, distances (nq,100).
     "sift-128-euclidean": ("http://ann-benchmarks.com/sift-128-euclidean.hdf5", "l2"),
+    "gist-960-euclidean": ("http://ann-benchmarks.com/gist-960-euclidean.hdf5", "l2"),
     "glove-100-angular": ("http://ann-benchmarks.com/glove-100-angular.hdf5", "cosine"),
     "fashion-mnist-784-euclidean":
         ("http://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5", "l2"),

@@ -107,7 +107,8 @@ class IVFPQ:
 
         Returns ``(distances, indices)`` (ADC squared L2) when
         ``return_distance`` else just ``indices``. ``variant`` selects the
-        fine-scan kernel (``"auto"`` | ``"online"`` | ``"batch"``).
+        fine-scan kernel; ``"auto"`` (default) routes to the best available
+        kernel (see :func:`flashlib.primitives.ivf_pq.flash_ivf_pq_search`).
         """
         if self.index_ is None:
             raise RuntimeError("IVFPQ not fitted; call fit() first.")

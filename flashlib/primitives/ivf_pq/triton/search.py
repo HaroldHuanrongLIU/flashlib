@@ -28,17 +28,25 @@ scan then takes one of two roads:
    the next tile starts. The full LUT is never materialised and results are
    identical to the untiled computation.
 
-``"auto"`` (default) routes by estimated work (see :func:`_pick_variant`).
-At a fixed ``(nlist, nprobe)`` and codebooks all variants return the same
-ADC ranking/distances (to fp tolerance) as a reference IVF-PQ; only the
+``"auto"`` (default) first picks the road -- the LUT scan for long PQ
+sub-vectors at modest batch, decode+GEMM for short sub-vectors *or* large
+batches (where it amortises each list's decode across the many queries
+probing it) -- then the implementation tier: the hand-written
+CuTe DSL kernels on Hopper (``cute_lut`` / ``cute_gemm``,
+:mod:`...ivf_pq.cutedsl`), the portable Triton kernels elsewhere
+(``online`` / ``gemm``). See :func:`_pick_variant`. At a fixed
+``(nlist, nprobe)`` and codebooks all variants return the same ADC
+ranking/distances (to fp tolerance) as a reference IVF-PQ; only the
 kernel implementation differs.
 """
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Optional
 
 import torch
 
+from flashlib.kernels.cute_helpers import is_cutedsl_available
 from flashlib.primitives.ivf_pq.index import IvfPqIndex
 from flashlib.primitives.ivf_pq.torch_fallback import _pad_features
 from flashlib.primitives.ivf_pq.triton.fine_scan import ivf_pq_fine_scan
@@ -56,20 +64,31 @@ from flashlib.primitives.knn import flash_knn
 # "gemm" path builds no LUT and never needs it.)
 _LUT_BUDGET_BYTES = 1 << 31  # 2 GiB
 
-# The cluster-centric GEMM has a higher fixed floor than the online LUT
-# kernel (~0.9 ms vs ~0.45 ms: a host argsort of the nq*nprobe pairs, two
-# kernels, an exact re-rank), so it only wins once two things hold:
-#   * nq is large enough to fill per-list query tiles and amortise the
-#     grouping / extra launches (>= _GEMM_MIN_NQ), and
-#   * the total candidate comparisons -- nq * nprobe * (M / nlist) -- are
-#     enough to repay the floor (>= _GEMM_MIN_WORK).
-# Both gates are needed: the crossover work shifts ~10x with list length
-# (long lists give the LUT scan better gather locality), so a work-only
-# rule mis-routes. Calibrated on Hopper across index sizes; in the win
-# regime GEMM is 2-12x faster, and near the boundary either choice is
-# within ~1.2x on a sub-2 ms call.
+# Decode+GEMM has a higher fixed floor than the LUT scan (~0.9 ms vs
+# ~0.45 ms: a host argsort of the nq*nprobe pairs, extra launches, an
+# exact re-rank), so for *tiny* batches / little total work the LUT scan
+# wins outright regardless of geometry: nq must clear _GEMM_MIN_NQ and the
+# candidate comparisons -- nq * nprobe * (M / nlist) -- must clear
+# _GEMM_MIN_WORK before the GEMM floor can be repaid. Calibrated on Hopper.
 _GEMM_MIN_NQ = 256
 _GEMM_MIN_WORK = 2_000_000
+
+# Past the floor, the road is a 2-variable crossover (calibrated on Hopper,
+# D=128/256/960). Per probed candidate the LUT does ``m`` gathers while
+# decode+GEMM reconstructs ``D = m*dsub`` dims -- but decode+GEMM decodes a
+# list's codes *once* per list and reuses them across every query probing
+# that list, so its cost is amortised by the queries-per-list
+# ``qpl = nq*nprobe/nlist``. Two conditions must hold for the LUT to win:
+#   * sub-vectors long enough: ``dsub >= _DSUB_LUT_MIN`` (short sub-vectors
+#     decode cheaply, and a large-m LUT loses occupancy to its SMEM table),
+#   * batch small enough per list: ``qpl <= _QPL_LUT_SLOPE * dsub`` (the
+#     decode+GEMM win region grows ~linearly with qpl, so at high batch the
+#     tensor cores win even for long sub-vectors).
+# Measured boundary: dsub<9 -> GEMM always; else LUT iff qpl <= 2*dsub
+# (e.g. dsub=16 flips LUT->GEMM near qpl~32; GIST dsub>=10 stays LUT at the
+# qpl~16 its 1k-query set allows). Either side of the seam is within ~1.2x.
+_DSUB_LUT_MIN = 9
+_QPL_LUT_SLOPE = 2.0
 
 
 def _auto_q_tile(nq: int, nprobe: int, m: int, by_residual: bool) -> int:
@@ -80,17 +99,65 @@ def _auto_q_tile(nq: int, nprobe: int, m: int, by_residual: bool) -> int:
     return int(max(256, min(nq, bq)))
 
 
-def _pick_variant(variant: str, nq: int, nprobe: int, avg_list_len: float) -> str:
-    if variant in ("gemm", "batch", "online"):
+@lru_cache(maxsize=None)
+def _cutedsl_hopper() -> bool:
+    """True iff the CuTe DSL fine-scan kernels can run on this machine.
+
+    They are hand-written for Hopper (SM90 WGMMA / shared-memory gathers)
+    and need the CUTLASS Python DSL; otherwise the router falls back to the
+    portable Triton kernels. Device arch is fixed per process, so cache it.
+    """
+    if not is_cutedsl_available():
+        return False
+    try:
+        return (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_properties(0).major >= 9
+        )
+    except Exception:
+        return False
+
+
+def _pick_regime(
+    nq: int, nprobe: int, avg_list_len: float, dsub: int, nlist: int,
+) -> str:
+    """Pick the fine-scan road: ``"lut"`` (ADC gather) or ``"gemm"``.
+
+    Tiny batches / low total work don't amortise the GEMM floor -> LUT.
+    Otherwise the LUT wins only when sub-vectors are long enough *and* the
+    batch (queries-per-list) is small enough that decode+GEMM can't amortise
+    its per-list decode (see ``_DSUB_LUT_MIN`` / ``_QPL_LUT_SLOPE``).
+    """
+    work = nq * nprobe * max(avg_list_len, 1.0)
+    if nq < _GEMM_MIN_NQ or work < _GEMM_MIN_WORK:
+        return "lut"
+    qpl = nq * nprobe / max(nlist, 1)
+    if dsub >= _DSUB_LUT_MIN and qpl <= _QPL_LUT_SLOPE * dsub:
+        return "lut"
+    return "gemm"
+
+
+def _pick_variant(
+    variant: str, nq: int, nprobe: int, avg_list_len: float, dsub: int,
+    nlist: int,
+) -> str:
+    """Resolve ``variant`` to a concrete fine-scan kernel.
+
+    Explicit names pass through; ``"auto"`` first chooses the road
+    (:func:`_pick_regime`) then the implementation tier -- the fast CuTe
+    DSL kernels on Hopper, the portable Triton kernels elsewhere.
+    """
+    if variant in ("gemm", "batch", "online", "cute_lut", "cute_gemm"):
         return variant
     if variant != "auto":
-        raise ValueError(f"unknown variant {variant!r} (auto|gemm|batch|online)")
-    # No-LUT decode+GEMM for enough work (3-12x, ADC-exact, no LUT memory);
-    # online per-query LUT scan for small batches where it isn't amortised.
-    work = nq * nprobe * max(avg_list_len, 1.0)
-    if nq >= _GEMM_MIN_NQ and work >= _GEMM_MIN_WORK:
-        return "gemm"
-    return "online"
+        raise ValueError(
+            f"unknown variant {variant!r} "
+            "(auto|gemm|batch|online|cute_lut|cute_gemm)"
+        )
+    regime = _pick_regime(nq, nprobe, avg_list_len, dsub, nlist)
+    if _cutedsl_hopper():
+        return "cute_lut" if regime == "lut" else "cute_gemm"
+    return "online" if regime == "lut" else "gemm"
 
 
 def _search_gemm(
@@ -115,6 +182,42 @@ def _search_gemm(
         Qp, centroids, codebooks, index.codes, probed, index.list_offsets, k,
         by_residual=index.by_residual,
     )                                                             # (nq, k)
+    valid = pos >= 0
+    pos_safe = pos.clamp_min(0)
+    ids = torch.where(valid, index.ids[pos_safe], torch.full_like(pos, -1))
+    return vals, ids
+
+
+def _search_cute(
+    index: IvfPqIndex,
+    Qp: torch.Tensor,
+    centroids: torch.Tensor,
+    codebooks: torch.Tensor,
+    k: int,
+    nprobe: int,
+    method: str,
+):
+    """CuTe DSL fine scan: shared-memory ADC LUT (``cute_lut``) or
+    decode+WGMMA GEMM (``cute_gemm``). Coarse + reduce mirror the Triton
+    ``"gemm"`` path; only the fine-scan kernel differs. Returns ``(vals, ids)``.
+    """
+    # Lazy import so non-CUTLASS environments still load the Triton path.
+    if method == "cute_lut":
+        from flashlib.primitives.ivf_pq.cutedsl.shared_lut import (
+            ivf_pq_fine_scan_shared_lut as _fine,
+        )
+    else:
+        from flashlib.primitives.ivf_pq.cutedsl.decode_gemm import (
+            ivf_pq_fine_scan_decode_gemm as _fine,
+        )
+    probed = flash_knn(
+        Qp.unsqueeze(0), centroids.unsqueeze(0), nprobe,
+        return_distances=False,
+    )[0].to(torch.int32)                                          # (nq, nprobe)
+    vals, pos = _fine(
+        Qp, centroids, codebooks, index.codes, probed, index.list_offsets, k,
+        by_residual=index.by_residual,
+    )
     valid = pos >= 0
     pos_safe = pos.clamp_min(0)
     ids = torch.where(valid, index.ids[pos_safe], torch.full_like(pos, -1))
@@ -184,13 +287,15 @@ def ivf_pq_search_triton(
         Q: ``(nq, D)`` query tensor on CUDA.
         k: neighbours per query.
         nprobe: lists to probe (defaults to ``index.nprobe``).
-        variant: ``"auto"`` | ``"gemm"`` | ``"online"`` | ``"batch"`` --
-            fine-scan kernel. ``"gemm"`` is the cluster-centric no-LUT
-            decode+GEMM path (fastest for batched search, builds no LUT);
-            ``"online"``/``"batch"`` are the ADC-LUT gather kernels (best
-            for tiny batches). ``"auto"`` routes by estimated work (see
-            :func:`_pick_variant`). All variants return the same ADC
-            distances to fp tolerance.
+        variant: fine-scan kernel. ``"auto"`` (default) routes by
+            sub-vector length and batch size to the best available kernel
+            (CuTe DSL on Hopper, Triton elsewhere; see
+            :func:`_pick_variant`). Explicit names: ``"cute_lut"`` /
+            ``"cute_gemm"`` are the Hopper CuTe DSL LUT / decode+GEMM
+            kernels; ``"gemm"`` is the portable Triton no-LUT decode+GEMM;
+            ``"online"`` / ``"batch"`` are the portable Triton ADC-LUT
+            gather kernels (best for tiny batches). All variants return the
+            same ADC distances to fp tolerance.
         q_tile: queries per LUT tile (LUT variants only -- the ``"gemm"``
             path builds no LUT and ignores it). ``None`` picks the largest
             tile whose ``(q_tile, P, m, 256)`` LUT fits the internal budget
@@ -215,9 +320,13 @@ def ivf_pq_search_triton(
     avg_list_len = index.M / max(index.nlist, 1)
 
     # No-LUT decode+GEMM path: no LUT to materialise, so no query tiling.
-    chosen = _pick_variant(variant, nq, nprobe, avg_list_len)
+    chosen = _pick_variant(
+        variant, nq, nprobe, avg_list_len, index.dsub, index.nlist,
+    )
     if chosen == "gemm":
         return _search_gemm(index, Qp_all, centroids, codebooks, k, nprobe)
+    if chosen in ("cute_lut", "cute_gemm"):
+        return _search_cute(index, Qp_all, centroids, codebooks, k, nprobe, chosen)
     variant = chosen  # "online" / "batch" -- passed straight to _search_tile
 
     if q_tile is None:

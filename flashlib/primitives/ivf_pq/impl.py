@@ -148,23 +148,28 @@ def flash_ivf_pq_search(
     the caller's original row ids (``-1`` padded when a query has fewer
     than ``k`` probed candidates).
 
-    ``variant`` selects the Triton fine-scan kernel:
+    ``variant`` selects the fine-scan kernel. ``"auto"`` (default) routes
+    by PQ sub-vector length and batch size to the best available kernel:
 
-    * ``"gemm"`` -- cluster-centric **decode + tensor-core GEMM** (no ADC
-      LUT). Groups queries by probed list, decodes each list's PQ codes
-      once per query tile, scores them with a WGMMA cross term, then
-      exact-re-ranks an oversampled pool so distances are ADC-exact. 3-12x
-      faster than the LUT kernels for batched search and builds no LUT.
-    * ``"online"`` -- per-``(query, list)`` ADC LUT gather (best for tiny
-      batches).
-    * ``"batch"`` -- group-by-list ADC LUT gather.
-    * ``"auto"`` (default) -- ``"gemm"`` once ``nq`` is past a handful,
-      else ``"online"``.
+    * ``"cute_lut"`` -- Hopper CuTe DSL **shared-memory ADC LUT** with
+      precomputed cross-term tables and a warp-shuffle top-k. Wins for long
+      sub-vectors (small ``m``) at modest batch.
+    * ``"cute_gemm"`` -- Hopper CuTe DSL **decode + WGMMA GEMM**. Decodes
+      each list's codes once and reuses them across the queries probing it,
+      so it wins for short sub-vectors (large ``m``) *or* large batches,
+      where tensor-core throughput beats the LUT's per-candidate gathers.
+    * ``"gemm"`` -- portable Triton **decode + tensor-core GEMM** (no ADC
+      LUT); the non-Hopper decode+GEMM fallback.
+    * ``"online"`` / ``"batch"`` -- portable Triton ADC-LUT gather kernels
+      (per-``(query, list)`` and group-by-list); the non-Hopper LUT
+      fallback, best for tiny batches.
 
-    All variants return the same ADC squared-L2 distances (to fp tol).
-    ``q_tile`` only affects the LUT variants' flash-style query tiling
-    (queries per LUT tile); ``None`` sizes it so the residual LUT is never
-    fully materialised. The ``"gemm"`` path builds no LUT and ignores it.
+    On Hopper ``"auto"`` uses the CuTe DSL kernels; elsewhere the Triton
+    kernels. All variants return the same ADC squared-L2 distances (to fp
+    tol). ``q_tile`` only affects the Triton LUT variants' flash-style
+    query tiling (queries per LUT tile); ``None`` sizes it so the residual
+    LUT is never fully materialised. The decode+GEMM paths build no LUT and
+    ignore it.
     """
     chosen = _route(backend=backend)
     if chosen == "triton" and Q.is_cuda and index.codes.is_cuda:

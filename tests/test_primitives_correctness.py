@@ -415,6 +415,58 @@ def test_ivf_pq_gemm_matches_oracle(by_residual):
         ), f"gemm vs online ADC distances diverge at nprobe={nprobe}"
 
 
+def _hopper_cutedsl():
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.get_device_properties(0).major < 9:
+        return False
+    from flashlib.kernels.cute_helpers import is_cutedsl_available
+    return is_cutedsl_available()
+
+
+@pytest.mark.skipif(not _hopper_cutedsl(), reason="Hopper + CUTLASS DSL required")
+@pytest.mark.parametrize("variant", ["cute_lut", "cute_gemm"])
+@pytest.mark.parametrize("by_residual", [True, False])
+def test_ivf_pq_cutedsl_matches_oracle(variant, by_residual):
+    """CuTe DSL fine-scan kernels == pure-torch ADC oracle.
+
+    ``cute_lut`` builds the asymmetric-distance LUT in shared memory from a
+    precomputed-table decomposition (the dsub cross term is a per-query /
+    per-index GEMM) and ADC-scans the codes with data-dependent SMEM
+    gathers (the road Triton cannot express) under a one-query-per-CTA
+    warp-shuffle top-k; ``cute_gemm`` decodes the codes to sub-vectors and
+    scores them with a WGMMA cross term. Both must reproduce the reference
+    ADC distances (to fp tolerance) and -- with every list probed -- ids.
+    """
+    from flashlib import flash_ivf_pq_build, flash_ivf_pq_search
+    from flashlib.primitives.ivf_pq import torch_fallback as tf
+
+    torch.manual_seed(0)
+    M, D, nlist, m, k = 16_000, 64, 64, 16, 10
+    X = _blobs(M, D, 12, "cuda", seed=2)
+    Q = _blobs(1024, D, 12, "cuda", seed=3)
+    index = flash_ivf_pq_build(
+        X, nlist, m=m, nprobe=16, by_residual=by_residual, niter=15, seed=0
+    )
+
+    # Exhaustive probing: identical candidate set for kernel and oracle.
+    cv, ci = flash_ivf_pq_search(index, Q, k, nprobe=nlist, variant=variant)
+    tv, ti = tf.ivf_pq_search_torch(index, Q, k, nprobe=nlist)
+    assert torch.allclose(
+        cv.sort(1).values, tv.sort(1).values, rtol=1e-3, atol=1e-1
+    ), f"{variant} ADC distances diverge from oracle (by_residual={by_residual})"
+    same = (ci.sort(1).values == ti.sort(1).values).float().mean().item()
+    assert same >= 0.98, f"{variant} vs oracle id mismatch: {same:.4f}"
+
+    # CuTe and the Triton gemm path resolve to the same ADC distances.
+    for nprobe in (8, 16):
+        cv, _ = flash_ivf_pq_search(index, Q, k, nprobe=nprobe, variant=variant)
+        gv, _ = flash_ivf_pq_search(index, Q, k, nprobe=nprobe, variant="gemm")
+        assert torch.allclose(
+            cv.sort(1).values, gv.sort(1).values, rtol=1e-3, atol=1e-1
+        ), f"{variant} vs gemm ADC distances diverge at nprobe={nprobe}"
+
+
 @cuda_only
 def test_ivf_pq_query_tiling_identical():
     """Flash-style query tiling is exact: tiled == untiled, bit for bit.
