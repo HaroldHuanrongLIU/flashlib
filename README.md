@@ -69,17 +69,6 @@ distances, indices = index.kneighbors(queries, n_neighbors=10)  # ADC squared L2
 print(index.compression_ratio)  # 32.0
 ```
 
-`m` (sub-quantizers) is the accuracy/size knob; returned distances are the
-asymmetric (ADC) squared-L2 to each candidate's PQ reconstruction.
-
-For batched search the fine-scan groups queries by the list they probe,
-**decodes** each list's PQ codes back to sub-vectors once per query tile,
-and scores them with a tensor-core cross term — ADC as a GEMM, with **no
-lookup table** to build or blow up with `nprobe` (an oversampled exact
-re-rank keeps distances ADC-exact). On SIFT1M (H100) this runs **1.2–2.4×
-faster than cuVS** IVF-PQ; tiny query batches fall back to a fused on-chip
-ADC lookup table. Same no-materialization spirit as the rest of flashlib —
-no `(queries × candidates)` matrix ever exists.
 
 ### Informative API
 
