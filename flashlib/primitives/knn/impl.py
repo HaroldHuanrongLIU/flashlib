@@ -99,14 +99,26 @@ _OP_NAME = {
 # sm_100 -- the CuteDSL backend (Blackwell kernel) is auto-routed there.
 _CUTEDSL_SMALLQ = 16
 
+# Largest k for which the Blackwell CuteDSL *build* is auto-routed. It wins
+# decisively for k<=20 on B200 (>=18% vs Triton and below cake at large N,
+# exact). Its per-thread top-K is O(k^2) so it crosses over ~k=22-24; above that
+# the Triton build is MMA-bound (~flat in k) and already matches/beats cake, so
+# high-k builds stay on Triton. (Measured B200 ours-vs-Triton crossover sweep.)
+_CUTEDSL_BUILD_KMAX = 20
+
 
 def _cutedsl_autopick(x: torch.Tensor, c: torch.Tensor, k: int,
                       hw: _hw.HwProps) -> bool:
-    """Whether to transparently route to the CuteDSL backend instead of
-    Triton. Only fires where Triton can't serve the shape: small-Q search
-    on sm_100 (Triton's ``tl.dot`` needs M>=16), BF16/D=128, single batch
-    -- where the Blackwell CuteDSL search kernel both restores a working
-    path *and* wins. Build / large-Q stay on Triton (already competitive)."""
+    """Whether to transparently route to the CuteDSL Blackwell backend instead
+    of Triton. BF16 / D=128 / single batch on sm_100 only. Two regimes win:
+
+      * build (self-kNN, k<=``_CUTEDSL_BUILD_KMAX``): the tcgen05 split-K +
+        register top-K build beats Triton 2-3x and cake 1.3-3x at large N. High
+        k stays on Triton (top-K-bound there; Triton ~ties cake).
+      * search (small-Q, N<``_CUTEDSL_SMALLQ``): Triton's ``tl.dot`` needs M>=16
+        so it can't even run; the CuteDSL search kernel restores it *and* wins.
+
+    Any failure falls back to Triton, so routing here never regresses."""
     if not hw.is_blackwell:
         return False
     B, N, Dd = x.shape
@@ -115,15 +127,20 @@ def _cutedsl_autopick(x: torch.Tensor, c: torch.Tensor, k: int,
         return False
     if x.dtype != torch.bfloat16 or c.dtype != torch.bfloat16:
         return False
-    is_build = (x.data_ptr() == c.data_ptr() and N == M)
-    if is_build:
-        return False  # large-Q build stays on Triton
-    if N >= _CUTEDSL_SMALLQ:
-        return False  # Triton's MMA-batched search already wins here
     try:
         from flashlib.primitives.knn.cutedsl.blackwell_impl import (
             blackwell_supported)
     except Exception:  # noqa: BLE001
+        return False
+    is_build = (x.data_ptr() == c.data_ptr() and N == M)
+    if is_build:
+        # CuteDSL build wins for small/mid k; high-k top-K is O(k^2) and loses
+        # to Triton (MMA-bound, ~flat in k), which already matches cake there.
+        if k > _CUTEDSL_BUILD_KMAX:
+            return False
+        return blackwell_supported(x, c, k)
+    # search: only where Triton's MMA-batched path can't run (small Q).
+    if N >= _CUTEDSL_SMALLQ:
         return False
     return blackwell_supported(x, c, k)
 

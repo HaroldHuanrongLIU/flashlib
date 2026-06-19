@@ -1,7 +1,8 @@
 """Blackwell (sm_100) CuteDSL flash-KNN kernels (BF16, D=128).
 
-Two specialized kernels, implementing the maxtree top-K design, targeting the
-regimes where flashlib's Triton path is weakest on B200 / Triton 3.4:
+Two specialized kernels, implementing an exact register/smem top-K design,
+targeting the regimes where flashlib's Triton path is weakest on B200 /
+Triton 3.4:
 
 * :class:`BlackwellKnnBuild` -- self-kNN / large-Q "build" via ``tcgen05``
   MMA (5th-gen tensor cores) + TMA bulk loads + a register top-K fused in
@@ -132,8 +133,8 @@ def _row_sqnorm(x2d: torch.Tensor, out=None) -> torch.Tensor:
 def _merge(part_s, part_i, x_sq, k):
     """Fused per-row top-K merge of split partials -> (dist f32, idx i32).
 
-    Partials may keep k_keep != k per split (the fast large-N path keeps fewer
-    per split and recovers the true top-k here)."""
+    Reduces the S*k unsorted partials per row to the global sorted top-k and
+    recovers the true distance (adds the dropped x_sq term, clamps >=0)."""
     N, S, k_keep = part_s.shape
     SK = S * k_keep
     ps = part_s.reshape(N, SK).contiguous()
@@ -168,7 +169,7 @@ if _BW_AVAILABLE:
             self.num_ab_stage = 2
             self.threads_per_cta = 128
 
-        # ---- reusable device-side top-K (maxtree-style), @cute.jit-inlined ----
+        # ---- reusable device-side exact top-K, @cute.jit-inlined ----
         # Factored out of the kernel body so build/search/fused variants can
         # share one tuned implementation. These are preprocessed + inlined at
         # trace time (zero runtime cost vs hand-inlining). Rules: mutable rmem
@@ -188,25 +189,34 @@ if _BW_AVAILABLE:
             return best_d, best_i, cutlass.Float32(INF), cutlass.Int32(0)
 
         @cute.jit
-        def _worst_tree(self, best_d, K: cutlass.Constexpr):
-            """Balanced max-tree over best_d -> (worst_d, worst_pos). O(log K)
-            dependent compares vs O(K) for a linear scan."""
-            items = []
-            for j in cutlass.range_constexpr(K):
-                items.append((best_d[j], cutlass.Int32(j)))
-            while cutlass.const_expr(len(items) > 1):
-                nxt = []
-                m = len(items) // 2
-                for a in cutlass.range_constexpr(m):
-                    va, pa = items[2 * a]
-                    vb, pb = items[2 * a + 1]
-                    gt = vb > va
-                    nxt.append((cutlass.max(va, vb),
-                                cutlass.select_(gt, pb, pa)))
-                if cutlass.const_expr(len(items) % 2 == 1):
-                    nxt.append(items[-1])
-                items = nxt
-            return items[0]
+        def _worst_of(self, best_d, K: cutlass.Constexpr):
+            """Streaming running-max worst-of-K -> (worst_d, worst_pos), O(1)
+            live state (only worst_d/worst_pos carry across iters). Mirrors
+            cake's k32 kernel (`stage1_k32_unordered`, the `scan_pos` loop).
+
+            Two CuteDSL-specific choices, both validated by benchmarking against
+            the alternatives that look better on paper:
+
+            * cake uses a balanced max-tree at small K (k10:
+              ``..._vmin_maxtree``); in CuteDSL the max-tree -- which
+              materialises all K leaves into SSA at once on top of the 64-float
+              MMA fragment -- is ~2x SLOWER even at k=5/10 (MLIR keeps the leaves
+              live and spills). The streaming scan keeps two scalars live.
+            * keeping best_d/best_i in registers (compile-time-indexed predicated
+              writes, so no dynamic ``best_d[worst_pos]`` store -> local memory)
+              looks like it should beat the local-memory scan, but forcing all
+              2K values live blows up register pressure (k=32: ~7x SLOWER). The
+              dynamic store + this local-memory scan keeps occupancy high; the
+              scan only runs on the rare insert (the group-min skip rejects most
+              candidates) so the local loads stay L1-resident and cheap."""
+            worst_d = best_d[0]
+            worst_pos = cutlass.Int32(0)
+            for jj in cutlass.range_constexpr(K - 1):
+                j = jj + 1
+                gt = best_d[j] > worst_d
+                worst_d = cutlass.select_(gt, best_d[j], worst_d)
+                worst_pos = cutlass.select_(gt, cutlass.Int32(j), worst_pos)
+            return worst_d, worst_pos
 
         @cute.jit
         def _topk_consume_tile(self, best_d, best_i, worst_d, worst_pos, frag,
@@ -229,7 +239,7 @@ if _BW_AVAILABLE:
                         if cv < worst_d:
                             best_d[worst_pos] = cv
                             best_i[worst_pos] = cutlass.Int32(base + g * 4 + t)
-                            worst_d, worst_pos = self._worst_tree(best_d, K)
+                            worst_d, worst_pos = self._worst_of(best_d, K)
             return worst_d, worst_pos
 
         @cute.jit
@@ -408,7 +418,7 @@ if _BW_AVAILABLE:
 
             tmem.relinquish_alloc_permit()
 
-            # per-thread running top-K (maxtree-style), via reusable device helper.
+            # per-thread running exact top-K, via reusable device helper.
             best_d, best_i, worst_d, worst_pos = self._topk_init(K)
 
             tiles_per_split = n_db_tiles // num_splits
@@ -484,8 +494,8 @@ if _BW_AVAILABLE:
                         acc_pipeline.producer_commit(acc_prod)
                         acc_prod.advance()
 
-                # maxtree-style top-K update (group-min skip + max-tree recompute),
-                # via the reusable device helper.
+                # exact top-K update (group-min threshold skip + streaming
+                # worst-of-K recompute), via the reusable device helper.
                 base = db * BLOCK_N
                 frag = tTR_rAcc.load()
                 worst_d, worst_pos = self._topk_consume_tile(
@@ -628,17 +638,6 @@ _BUILD_CACHE: dict = {}
 _SEARCH_CACHE: dict = {}
 
 
-# Per-split retained-K cap. For k>KEEP_CAP at large N we keep only the top
-# KEEP_CAP per split (maxtree's k10t32 strategy) and recover the true top-k in the
-# merge over S*KEEP_CAP candidates. This keeps the hot top-K array in registers
-# -- CuteDSL spills larger per-thread arrays to local memory (the worst
-# recompute then does O(K) local loads/insertion, ~linear slowdown), whereas
-# nvcc keeps maxtree's full-K array in registers. Below SMALL_N_EXACT, full-k per
-# split is cheap enough that we stay exact.
-KEEP_CAP = 5
-SMALL_N_EXACT = 2048
-
-
 def _pow2_div(want: int, n_db_tiles: int) -> int:
     want = min(max(1, want), n_db_tiles)
     p = 1
@@ -647,28 +646,22 @@ def _pow2_div(want: int, n_db_tiles: int) -> int:
     return p
 
 
-def pick_splits_build(N: int, target_ctas: int = 300) -> int:
-    """SM-fill split count for the EXACT path (full-k per split). The register
-    top-K streams long db runs cheaply, so we only split enough to fill the SMs
-    (~``target_ctas`` CTAs = n_q_tiles * S): S~2 at N=16384."""
+_SM_FILL = 96  # ~B200 SM count; below this many q-tiles we split to fill
+
+
+def pick_splits_build(N: int, k: int = 0) -> int:
+    """Split count for the (always-exact) build. Each split keeps the full
+    top-k per query row and the worst recompute streams cheaply (group-min
+    skip), so a single split with long db runs is the cheapest (no extra merge
+    candidates, one partial write) -- this matches cake's preference for very
+    few splits. We therefore use S=1 as soon as the query tiles alone roughly
+    fill the SMs (``n_q_tiles >= _SM_FILL``); only smaller N splits the db to
+    reach ~2 waves. Empirically S=1 beats S=4 by ~1.8x at N=16384, k=10."""
     n_db_tiles = N // BLOCK_N
     n_q_tiles = max(1, N // BLOCK_Q)
-    return _pow2_div(round(target_ctas / n_q_tiles), n_db_tiles)
-
-
-def choose_build_config(N: int, k: int):
-    """Pick (k_keep, num_splits) for the build. Exact (k_keep==k) when
-    k<=KEEP_CAP or (small N and moderate k); else maxtree-style k_keep=KEEP_CAP
-    with fine splits."""
-    n_db_tiles = N // BLOCK_N
-    if k <= KEEP_CAP or (N <= SMALL_N_EXACT and k <= 10):
-        return k, pick_splits_build(N)
-    # Approx path: recall is set by the split count -- per split the number of
-    # true neighbours is ~Binom(k, 1/S), and we keep only KEEP_CAP of them, so
-    # we need S comfortably above k (S~3k => mean k/S~1/3, P[>KEEP_CAP]~0). This
-    # is independent of N, so don't over-split large N (bloats merge + MMA).
-    s_recall = max(pick_splits_build(N), 32, 3 * k)
-    return KEEP_CAP, _pow2_div(s_recall, n_db_tiles)
+    if n_q_tiles >= _SM_FILL:
+        return 1
+    return _pow2_div(round(256 / n_q_tiles), n_db_tiles)
 
 
 def pick_splits_search(Q: int, M: int, target_ctas: int = 320,
@@ -689,40 +682,36 @@ def _cur_stream():
 
 def knn_build_cutedsl(x: torch.Tensor, k: int, *, num_splits=None,
                       part_s=None, part_i=None, x_sq=None,
-                      exact: bool = False, return_distances: bool = True):
-    """Self-kNN build for x:(N,D) bf16, D=128. Returns idx (N,k) i32 (and
+                      return_distances: bool = True):
+    """Exact self-kNN build for x:(N,D) bf16, D=128. Returns idx (N,k) i32 (and
     dist (N,k) f32 when ``return_distances``).
 
-    For k>KEEP_CAP at large N the default keeps top-KEEP_CAP per split (maxtree's
-    k10t32 strategy: registers-only hot top-K, recall ~1.0). ``exact=True``
-    forces full-k per split (guaranteed recall 1.0, ~2-3x slower at large N due
-    to a CuteDSL local-memory spill the CUDA path avoids)."""
+    Always exact: each split keeps the full top-k per query row (cake's design)
+    and the merge reduces the S*k partials to the global top-k. The worst-of-K
+    recompute is a streaming linear scan (O(1) live state) so the per-thread
+    top-K stays small even at k=32."""
     if x.dim() == 3:
         x = x[0]
     N, Dd = x.shape
     assert Dd == D and x.dtype == torch.bfloat16
     if N % BLOCK_Q != 0:
         raise ValueError(f"build requires N % {BLOCK_Q} == 0, got N={N}")
-    if exact:
-        k_keep, s_def = k, pick_splits_build(N)
-    else:
-        k_keep, s_def = choose_build_config(N, k)
-    S = num_splits if num_splits is not None else s_def
+    S = num_splits if num_splits is not None else pick_splits_build(N, k)
     if x_sq is None:
         x_sq = _row_sqnorm(x)
     if part_s is None:
-        part_s = torch.empty((N, S, k_keep), device=x.device, dtype=torch.float32)
+        part_s = torch.empty((N, S, k), device=x.device, dtype=torch.float32)
     if part_i is None:
-        part_i = torch.empty((N, S, k_keep), device=x.device, dtype=torch.int32)
+        part_i = torch.empty((N, S, k), device=x.device, dtype=torch.int32)
     x3 = x.unsqueeze(-1)
     stream = _cur_stream()
     x_dl = from_dlpack(x3)
     sq_dl = from_dlpack(x_sq)
     dls = (x_dl, x_dl, sq_dl, from_dlpack(part_s), from_dlpack(part_i))
-    key = (N, k_keep, S)
+    key = (N, k, S)
     comp = _BUILD_CACHE.get(key)
     if comp is None:
-        comp = cute.compile(BlackwellKnnBuild(k_keep, S), *dls, stream)
+        comp = cute.compile(BlackwellKnnBuild(k, S), *dls, stream)
         _BUILD_CACHE[key] = comp
     comp(*dls, stream)
     dist, idx = _merge(part_s, part_i, x_sq, k)
