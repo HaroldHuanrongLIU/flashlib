@@ -35,6 +35,7 @@ Public API
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -42,6 +43,62 @@ import torch
 from flashlib.linalg.gemm import storage_dtype_for
 from flashlib.primitives.knn.triton._row_norm import _get_or_compute_csq
 from flashlib.primitives.knn.triton.dispatch import flash_knn_triton
+
+
+# =============================================================================
+# Maxtree top-K toggle (Blackwell BUILD design ported to Hopper)
+# =============================================================================
+#
+# The ``maxtree`` / ``smem_maxtree`` strategies are the register / smem ports of
+# the Blackwell BUILD top-K (unsorted heap + group-min-4 prune + max-tree).
+# Measured win regions on this H100 (see
+# ``benchmarks/results/micro_knn_maxtree_topk.md``):
+#
+#   * SEARCH (1-thread-per-row ``smem_maxtree``, WS3): wins at K<=16
+#     (1.13-1.36x across M=32k..131k); spills / loses at K>=32.
+#   * BUILD (register ``maxtree``, non-WS): wins at LARGE N + mid K, where
+#     the group-min-4 prune amortizes and the heap still fits registers --
+#     D<=128, N>=50k, K in [6,10] (K=8 1.25-1.48x, K=10 ~1.0-1.22x, K=6
+#     1.04-1.15x at the BM256/BN64 router tile). K<=4 (one prune group) and
+#     K>=12 (heap spills to local) lose; small N loses too (fixed merge +
+#     epilogue-sort overhead dominates the short mainloop). NOTE: at K>=32
+#     the build baseline is ``sortmerge`` (not ``perthread``), which the
+#     spilled maxtree does not beat.
+#
+# The heuristic therefore has THREE modes:
+#
+#   * "auto" (default): adopt each port ONLY in its measured win region
+#     (search K<=16; build D<=128 / N>=50k / K in [6,10]); keep the
+#     existing strategies everywhere else. This is the production default
+#     -- flash_knn transparently "eats" the wins without regressing any
+#     other shape.
+#   * "on":  full swap -- ``maxtree`` (build) + ``smem_maxtree`` (search) for
+#     every shape. The benchmark's NEW column.
+#   * "off": the original strategies everywhere (``smem_perthread`` for
+#     search). The benchmark's OLD baseline column.
+#
+# Drive it via ``FLASHLIB_KNN_MAXTREE`` (``1``/``0``, env, re-read each call)
+# or :func:`set_maxtree_enabled` (overrides env; ``None`` reverts to "auto").
+
+_USE_MAXTREE: Optional[bool] = None  # None -> "auto" (env / default).
+
+
+def set_maxtree_enabled(enabled: Optional[bool]) -> None:
+    """Force the maxtree top-K fully on / off (``None`` reverts to "auto")."""
+    global _USE_MAXTREE
+    _USE_MAXTREE = enabled
+
+
+def _maxtree_mode() -> str:
+    """Return one of ``"on"`` / ``"off"`` / ``"auto"`` (see module note)."""
+    if _USE_MAXTREE is True:
+        return "on"
+    if _USE_MAXTREE is False:
+        return "off"
+    env = os.environ.get("FLASHLIB_KNN_MAXTREE")
+    if env is None:
+        return "auto"
+    return "off" if env.lower() in ("0", "", "false", "no", "off") else "on"
 
 
 # =============================================================================
@@ -132,6 +189,7 @@ def _trim_dlpack_cache(max_entries: int = 64):
 
 
 def _heuristic_fa3_config(N: int, M: int, D: int, K_PAD: int) -> dict:
+    maxtree_mode = _maxtree_mode()  # "on" | "off" | "auto"
     is_build = (N >= 10_000) and (0.5 <= M / N <= 2.0)
     if is_build:
         BM = 256 if N >= 50_000 else 128
@@ -157,21 +215,43 @@ def _heuristic_fa3_config(N: int, M: int, D: int, K_PAD: int) -> dict:
         else:
             strat = "sortmerge"
             BN = 128 if BM == 128 else 64
+        # maxtree carve-out (measured on H100; see the module note +
+        # benchmarks/results/micro_knn_maxtree_topk.md). The unsorted heap
+        # + group-min-4 prune beats the sorted bubble-insert ``perthread``
+        # for mid K at large N, where the prune amortizes and the heap
+        # still fits registers. Win band: D<=128, N>=50k, K in [6,10]
+        # (K=8 1.25-1.48x, K=10 ~1.0-1.22x, K=6 1.04-1.15x). K<=4 / K>=12
+        # lose, so they keep ``perthread`` / ``sortmerge``. The BM256/BN64
+        # router tile is kept (BM=128 is slower for both strategies here).
+        maxtree_build_win = (D <= 128 and N >= 50_000 and 6 <= K_PAD <= 10)
+        if maxtree_mode == "on":
+            strat = "maxtree"
+        elif maxtree_mode == "auto" and maxtree_build_win:
+            strat = "maxtree"
         return dict(
             BM=BM, BN=BN,
             use_ws=False, topk_strategy=strat,
             use_ws3=False, use_ws4=False, dist_stage=1,
         )
 
+    # Search shapes: WS3 1-thread-per-row. smem_maxtree keeps the same WS3
+    # pipeline + chunk-min prune, swapping only the inner top-K.
     if K_PAD <= 16:
+        # smem_maxtree wins (or ties) here -> adopt it in "auto" and "on".
+        search_strat = (
+            "smem_perthread" if maxtree_mode == "off" else "smem_maxtree"
+        )
         return dict(
             BM=64, BN=128,
-            use_ws=True, topk_strategy="smem_perthread",
+            use_ws=True, topk_strategy=search_strat,
             use_ws3=True, use_ws4=False, dist_stage=3,
         )
+    # K>16 search: smem_maxtree spills (loses ~0.64x at K=32) -> only when
+    # fully forced on; "auto" keeps the sorted smem_perthread.
+    search_strat = "smem_maxtree" if maxtree_mode == "on" else "smem_perthread"
     return dict(
         BM=128, BN=64,
-        use_ws=True, topk_strategy="smem_perthread",
+        use_ws=True, topk_strategy=search_strat,
         use_ws3=True, use_ws4=False, dist_stage=3,
     )
 
@@ -194,7 +274,7 @@ def _autotune_fa3(x2d, c2d, c_sq_1d, out_i, k_pad: int, *, verbose: bool = False
     import cutlass.cute as cute_mod
     from cutlass.cute.runtime import from_dlpack as _from_dlpack
 
-    from flashlib.primitives.knn.cutedsl.fused_kernel import HopperFlashKnnFused
+    from flashlib.primitives.knn.cutedsl.hopper_impl import HopperFlashKnnFused
 
     N, D = x2d.shape
     M = c2d.shape[0]
@@ -207,9 +287,9 @@ def _autotune_fa3(x2d, c2d, c_sq_1d, out_i, k_pad: int, *, verbose: bool = False
         return (bm * D * bytes_per + bn * D * bytes_per + 1024) <= smem_capacity
 
     if k_pad <= 3:
-        strategies = ("insert", "perthread", "sortmerge")
+        strategies = ("insert", "perthread", "maxtree", "sortmerge")
     else:
-        strategies = ("perthread", "sortmerge")
+        strategies = ("perthread", "maxtree", "sortmerge")
 
     bms = (64, 128, 256)
     bns = (64, 128, 256)
@@ -234,15 +314,17 @@ def _autotune_fa3(x2d, c2d, c_sq_1d, out_i, k_pad: int, *, verbose: bool = False
     for bm, bn in ws3_tiles:
         if _fits(bm, bn):
             for stage in (3, 2):
-                candidates.append(
-                    (bm, bn, True, "smem_perthread", True, False, stage)
-                )
+                for smem_strat in ("smem_perthread", "smem_maxtree"):
+                    candidates.append(
+                        (bm, bn, True, smem_strat, True, False, stage)
+                    )
     ws4_tiles = [(64, 64), (64, 128), (128, 64)]
     for bm, bn in ws4_tiles:
         if _fits(bm, bn) and bm * bn <= 128 * 64:
-            candidates.append(
-                (bm, bn, True, "smem_perthread", True, True, 2)
-            )
+            for smem_strat in ("smem_perthread", "smem_maxtree"):
+                candidates.append(
+                    (bm, bn, True, smem_strat, True, True, 2)
+                )
 
     stream = cuda_drv.CUstream(0)
     best = None
@@ -422,7 +504,7 @@ def cutedsl_flash_knn(
             import cutlass
             import cutlass.cute as cute_mod
             from cutlass.cute.runtime import from_dlpack as _from_dlpack
-            from flashlib.primitives.knn.cutedsl.fused_kernel import (
+            from flashlib.primitives.knn.cutedsl.hopper_impl import (
                 HopperFlashKnnFused,
             )
 

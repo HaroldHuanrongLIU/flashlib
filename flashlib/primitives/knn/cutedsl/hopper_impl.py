@@ -755,6 +755,14 @@ class HopperFlashKnnFused:
             "insert", "perthread",
             "sortmerge", "sortmerge_packed",
             "smem_perthread", "warpsort", "auto",
+            # Maxtree top-K ported from the Blackwell BUILD kernel:
+            #   ``maxtree``      : register per-thread unsorted heap +
+            #                   group-min-4 prune + max-tree (the
+            #                   register analog of ``perthread``).
+            #   ``smem_maxtree`` : 1-thread-per-row WS3/WS4 variant of
+            #                   ``smem_perthread`` with the same maxtree
+            #                   inner loop.
+            "maxtree", "smem_maxtree",
         )
         if topk_strategy not in valid_strategies:
             raise ValueError(
@@ -780,13 +788,14 @@ class HopperFlashKnnFused:
         else:
             self.topk_strategy = topk_strategy
 
-        # smem_perthread / warpsort use CTA-wide ``cute.arch.sync_threads``
-        # for the SMEM dist relayout. That barrier includes producer
-        # warps when use_ws=True, which deadlocks with the producer/
-        # consumer pipeline. WS3 (separate top-K warpgroup with named
-        # barriers) lifts this restriction (see ``use_ws3``).
+        # smem_perthread / smem_maxtree / warpsort use CTA-wide
+        # ``cute.arch.sync_threads`` for the SMEM dist relayout. That
+        # barrier includes producer warps when use_ws=True, which
+        # deadlocks with the producer/consumer pipeline. WS3 (separate
+        # top-K warpgroup with named barriers) lifts this restriction
+        # (see ``use_ws3``).
         if (
-            self.topk_strategy in ("smem_perthread", "warpsort")
+            self.topk_strategy in ("smem_perthread", "smem_maxtree", "warpsort")
             and use_ws and not use_ws3
         ):
             raise ValueError(
@@ -795,6 +804,16 @@ class HopperFlashKnnFused:
                 "deadlocks with the producer/consumer pipeline). Set "
                 "use_ws=False, set use_ws3=True, or pick another "
                 "strategy."
+            )
+        # ``smem_maxtree`` is only wired into the WS3 / WS4 top-K warpgroup
+        # (the 1-thread-per-row layout the maxtree inner loop needs); it has
+        # no non-WS code path. Require use_ws3 so misconfigurations fail
+        # loudly at construction rather than tracing the wrong kernel.
+        if self.topk_strategy == "smem_maxtree" and not use_ws3:
+            raise ValueError(
+                "topk_strategy='smem_maxtree' requires use_ws3=True "
+                "(WS3/WS4 top-K warpgroup). Use 'maxtree' for the non-WS / "
+                "WS2 register path."
             )
 
         self.use_ws = bool(use_ws)
@@ -869,9 +888,10 @@ class HopperFlashKnnFused:
         if self.use_ws3:
             if not self.use_ws:
                 raise ValueError("use_ws3=True requires use_ws=True")
-            if self.topk_strategy != "smem_perthread":
+            if self.topk_strategy not in ("smem_perthread", "smem_maxtree"):
                 raise ValueError(
-                    f"use_ws3=True requires topk_strategy='smem_perthread', "
+                    f"use_ws3=True requires topk_strategy in "
+                    f"('smem_perthread', 'smem_maxtree'), "
                     f"got {self.topk_strategy!r}"
                 )
             if self.mma_warp_groups != 1:
@@ -921,7 +941,7 @@ class HopperFlashKnnFused:
         # WS3 multi-stages the dist tile: total size grows by
         # ``dist_stage`` so GEMM and TopK can ping-pong on different
         # buffers.
-        if self.topk_strategy in ("smem_perthread", "warpsort"):
+        if self.topk_strategy in ("smem_perthread", "smem_maxtree", "warpsort"):
             self.dist_smem_row_stride = n_block_size + 1
             self.dist_stage = max(1, int(dist_stage)) if self.use_ws3 else 1
             self.dist_smem_size = (
@@ -1562,11 +1582,19 @@ class HopperFlashKnnFused:
             heap_max = cute.make_rmem_tensor(
                 cute.make_layout(ROWS_OWNED), cutlass.Float32
             )
+            # ``maxtree`` also keeps the worst slot per row (the max-tree
+            # writes the evict position back here so a pruned chunk reads
+            # both worst_d and worst_pos from registers). Unused by the
+            # other strategies (compiles away).
+            heap_wpos = cute.make_rmem_tensor(
+                cute.make_layout(ROWS_OWNED), cutlass.Int32
+            )
             for i in cutlass.range_constexpr(ROWS_OWNED):
                 for k in cutlass.range_constexpr(K_INTERNAL):
                     heap_d[(i, k)] = cutlass.Float32(3.4e38)
                     heap_i[(i, k)] = cutlass.Int32(-1)
                 heap_max[i] = cutlass.Float32(3.4e38)
+                heap_wpos[i] = cutlass.Int32(0)
 
         # SMEM dist staging tensor (smem_perthread + warpsort).
         # Layout is (BM, BN) PADDED row-major fp32 with stride
@@ -1685,6 +1713,11 @@ class HopperFlashKnnFused:
                     dist_buf, ptPcP_mn, heap_d, heap_i, heap_max,
                     M_per_thr, N_per_thr, cta_n_offset,
                 )
+            elif cutlass.const_expr(self.topk_strategy == "maxtree"):
+                self._chunk_topk_maxtree(
+                    dist_buf, ptPcP_mn, heap_d, heap_i, heap_max, heap_wpos,
+                    M_per_thr, N_per_thr, cta_n_offset,
+                )
             elif cutlass.const_expr(self.topk_strategy == "sortmerge"):
                 self._chunk_topk_sortmerge(
                     dist_buf, ptPcP_mn, heap_d, heap_i, heap_max,
@@ -1763,6 +1796,10 @@ class HopperFlashKnnFused:
             self._warp_merge_topk_perthread(
                 tiled_mma, heap_d, heap_i, M_per_thr,
             )
+        elif cutlass.const_expr(self.topk_strategy == "maxtree"):
+            self._warp_merge_topk_maxtree(
+                tiled_mma, heap_d, heap_i, M_per_thr,
+            )
         elif cutlass.const_expr(self.topk_strategy == "sortmerge"):
             self._warp_merge_topk_sortmerge(
                 tiled_mma, heap_d, heap_i, M_per_thr,
@@ -1819,7 +1856,11 @@ class HopperFlashKnnFused:
                             ]
         else:
             if ptPcP[0][1] == 0:
-                if cutlass.const_expr(self.topk_strategy == "insert"):
+                if cutlass.const_expr(
+                    self.topk_strategy in ("insert", "maxtree")
+                ):
+                    # insert + maxtree keep the heap UNSORTED -> one-shot
+                    # selection sort restores ascending order for the write.
                     self._sort_topk_rows(heap_d, heap_i, M_per_thr, K_PAD)
                 for i in cutlass.range_constexpr(M_per_thr):
                     m_local = ptPcP_mn[(i, 0)][0]
@@ -3177,6 +3218,227 @@ class HopperFlashKnnFused:
                 offset = offset // 2
 
     # ----------------------------------------------------------------------
+    # Maxtree top-K (ported from the Blackwell BUILD kernel, sm_100)
+    # ----------------------------------------------------------------------
+    #
+    # An UNSORTED per-thread register top-K with a cached
+    # ``(worst_d, worst_pos)`` and two wins over the sorted bubble-insert
+    # ``perthread`` path:
+    #   * group-min-4 prune: scan candidates 4 at a time; if even the min
+    #     of the 4 can't beat ``worst_d``, skip all 4 with ONE compare
+    #     (vs 1 compare/element for the sorted path).
+    #   * balanced max-tree: recompute the evict slot in O(log K) depth
+    #     after each insert (vs the O(K) sorted-bubble carry).
+    # ``(worst_d, worst_pos)`` persist across chunks in small constexpr-
+    # indexed register arrays (``heap_max`` / ``heap_wpos``), so a fully
+    # pruned chunk touches the heap zero times. The heap stays unsorted in
+    # the mainloop; a one-shot selection sort in the epilogue restores
+    # ascending order before the GMEM write. See ``blackwell_impl.py``
+    # (``_topk_init`` / ``_worst_tree`` / ``_topk_consume_tile``) for the
+    # sm_100 original.
+
+    @cute.jit
+    def _worst_tree_row(
+        self, heap_d, row: cutlass.Constexpr, K: cutlass.Constexpr,
+    ):
+        """Balanced max-tree over ``heap_d[row, :]`` -> (worst_d, worst_pos).
+
+        O(log K) dependent compares to find the largest (worst) entry and
+        its slot, vs O(K) for a linear scan. The tree is unrolled at trace
+        time (the ``items`` list is Python-level metaprogramming, same as
+        the Blackwell ``_worst_tree``)."""
+        items = []
+        for j in cutlass.range_constexpr(K):
+            items.append((heap_d[(row, j)], cutlass.Int32(j)))
+        while cutlass.const_expr(len(items) > 1):
+            nxt = []
+            m = len(items) // 2
+            for a in cutlass.range_constexpr(m):
+                va, pa = items[2 * a]
+                vb, pb = items[2 * a + 1]
+                gt = vb > va
+                nxt.append((cutlass.max(va, vb), cutlass.select_(gt, pb, pa)))
+            if cutlass.const_expr(len(items) % 2 == 1):
+                nxt.append(items[-1])
+            items = nxt
+        return items[0]
+
+    @cute.jit
+    def _maxtree_insert(
+        self, heap_d, heap_i, row: cutlass.Constexpr, K: cutlass.Constexpr,
+        worst_pos, c_d, c_i,
+    ):
+        """Evict the current worst entry with the candidate, then refresh
+        ``(worst_d, worst_pos)`` via the max-tree. Caller guarantees
+        ``c_d < worst_d``. Returns the refreshed ``(worst_d, worst_pos)``.
+
+        The dynamic store ``heap_d[row, worst_pos]`` is intentional: an
+        O(K) predicated-write loop that keeps the heap register-resident
+        was measured ~2x SLOWER here (the per-insert scan of all K slots
+        dominates), while the dynamic store touches the heap only on the
+        rare inserts that survive the group-min prune."""
+        heap_d[(row, worst_pos)] = c_d
+        heap_i[(row, worst_pos)] = c_i
+        return self._worst_tree_row(heap_d, row, K)
+
+    @cute.jit
+    def _chunk_topk_maxtree(
+        self, dist_buf, ptPcP_mn, heap_d, heap_i, heap_max, heap_wpos,
+        M_per_thr: cutlass.Constexpr,
+        N_per_thr: cutlass.Constexpr,
+        cta_n_offset,
+    ):
+        """Per-thread maxtree top-K update over this thread's column slice.
+
+        ``(worst_d, worst_pos)`` live in ``heap_max`` / ``heap_wpos``
+        across chunks, so a fully pruned chunk does only ``N_per_thr // 4``
+        group-min compares against the cached ``worst_d`` and never reads
+        the heap. Index of column ``j`` is recovered from the identity
+        tensor ``ptPcP_mn`` (the WGMMA TV-layout column owner)."""
+        K = self.k_pad
+        NG = N_per_thr // 4
+        REM = N_per_thr - NG * 4
+        for i in cutlass.range_constexpr(M_per_thr):
+            worst_d = heap_max[i]
+            worst_pos = heap_wpos[i]
+            for g in cutlass.range_constexpr(NG):
+                base = g * 4
+                c0 = dist_buf[(i, base + 0)]
+                c1 = dist_buf[(i, base + 1)]
+                c2 = dist_buf[(i, base + 2)]
+                c3 = dist_buf[(i, base + 3)]
+                gmin = cutlass.min(cutlass.min(c0, c1), cutlass.min(c2, c3))
+                if gmin < worst_d:
+                    cands = [c0, c1, c2, c3]
+                    for t in cutlass.range_constexpr(4):
+                        cv = cands[t]
+                        if cv < worst_d:
+                            n_local = ptPcP_mn[(i, base + t)][1]
+                            c_i = cutlass.Int32(n_local + cta_n_offset)
+                            worst_d, worst_pos = self._maxtree_insert(
+                                heap_d, heap_i, i, K, worst_pos, cv, c_i,
+                            )
+            for r in cutlass.range_constexpr(REM):
+                j = NG * 4 + r
+                cv = dist_buf[(i, j)]
+                if cv < worst_d:
+                    n_local = ptPcP_mn[(i, j)][1]
+                    c_i = cutlass.Int32(n_local + cta_n_offset)
+                    worst_d, worst_pos = self._maxtree_insert(
+                        heap_d, heap_i, i, K, worst_pos, cv, c_i,
+                    )
+            heap_max[i] = worst_d
+            heap_wpos[i] = worst_pos
+
+    @cute.jit
+    def _warp_merge_topk_maxtree(
+        self, tiled_mma, heap_d, heap_i,
+        M_per_thr: cutlass.Constexpr,
+    ):
+        """Butterfly-merge unsorted per-thread maxtree top-Ks across the
+        threads-in-row reduction group. Mirrors
+        ``_warp_merge_topk_perthread`` but inserts peer entries via the
+        maxtree (unsorted + max-tree) insert. Snapshot-before-mutate: all K
+        peer entries are shuffled into registers before any insert."""
+        K = self.k_pad
+        red_target = self._reduction_target_n(tiled_mma)
+        red_rank = cute.rank(red_target)
+        for rr in cutlass.range_constexpr(red_rank):
+            tig = red_target.shape[rr]
+            offset = tig // 2
+            while offset > 0:
+                peer_d_buf = cute.make_rmem_tensor(
+                    cute.make_layout(K), cutlass.Float32
+                )
+                peer_i_buf = cute.make_rmem_tensor(
+                    cute.make_layout(K), cutlass.Int32
+                )
+                for i in cutlass.range_constexpr(M_per_thr):
+                    for kk in cutlass.range_constexpr(K):
+                        peer_d_buf[kk] = cute.arch.shuffle_sync_bfly(
+                            heap_d[(i, kk)],
+                            offset=offset, mask=-1, mask_and_clamp=31,
+                        )
+                        peer_i_buf[kk] = cute.arch.shuffle_sync_bfly(
+                            heap_i[(i, kk)],
+                            offset=offset, mask=-1, mask_and_clamp=31,
+                        )
+                    worst_d, worst_pos = self._worst_tree_row(heap_d, i, K)
+                    for kk in cutlass.range_constexpr(K):
+                        c_d = peer_d_buf[kk]
+                        c_i = peer_i_buf[kk]
+                        if c_d < worst_d:
+                            worst_d, worst_pos = self._maxtree_insert(
+                                heap_d, heap_i, i, K, worst_pos, c_d, c_i,
+                            )
+                offset = offset // 2
+
+    @cute.jit
+    def _chunk_topk_smem_maxtree(
+        self, sDist, sChunkMin, heap_d, heap_i, heap_max, heap_wpos,
+        BM: cutlass.Constexpr, BN: cutlass.Constexpr,
+        rows_per_thr: cutlass.Constexpr,
+        cta_m_offset, cta_n_offset, N_total, M_total,
+        consumer_tidx, sWorstD=None,
+    ):
+        """smem maxtree inner loop (1 thread per row, WS3 / WS4).
+
+        Keeps the per-row chunk-min prune of
+        ``_chunk_topk_smem_perthread_with_chunkmin`` (skip the whole
+        BN-element loop when the chunk can't beat ``worst_d``) but
+        replaces the per-element sorted bubble with the maxtree group-min-4
+        prune + unsorted heap + max-tree. OOB db columns are +inf in
+        ``sDist`` (the GEMM WG pads ``c_sq``), so they never insert and
+        need no per-element bound check. ``worst_d`` (max of K) is the
+        same value the sorted path wrote, so the Mode-H ``sWorstD``
+        contract is preserved."""
+        K = self.k_pad
+        NG = BN // 4
+        REM = BN - NG * 4
+        for r in cutlass.range_constexpr(rows_per_thr):
+            my_row = consumer_tidx + r * 128
+            if my_row < BM:
+                m_global = my_row + cta_m_offset
+                if m_global < N_total:
+                    worst_d = heap_max[r]
+                    worst_pos = heap_wpos[r]
+                    chunk_min = sChunkMin[my_row]
+                    if chunk_min < worst_d:
+                        for g in cutlass.range(NG, unroll=4):
+                            base = g * 4
+                            c0 = sDist[(my_row, base + 0)]
+                            c1 = sDist[(my_row, base + 1)]
+                            c2 = sDist[(my_row, base + 2)]
+                            c3 = sDist[(my_row, base + 3)]
+                            gmin = cutlass.min(
+                                cutlass.min(c0, c1), cutlass.min(c2, c3)
+                            )
+                            if gmin < worst_d:
+                                cands = [c0, c1, c2, c3]
+                                for t in cutlass.range_constexpr(4):
+                                    cv = cands[t]
+                                    if cv < worst_d:
+                                        c_i = cutlass.Int32(
+                                            base + t + cta_n_offset
+                                        )
+                                        worst_d, worst_pos = self._maxtree_insert(
+                                            heap_d, heap_i, r, K,
+                                            worst_pos, cv, c_i,
+                                        )
+                        for rt in cutlass.range_constexpr(REM):
+                            j = NG * 4 + rt
+                            cv = sDist[(my_row, j)]
+                            if cv < worst_d:
+                                c_i = cutlass.Int32(j + cta_n_offset)
+                                worst_d, worst_pos = self._maxtree_insert(
+                                    heap_d, heap_i, r, K, worst_pos, cv, c_i,
+                                )
+                        heap_max[r] = worst_d
+                        heap_wpos[r] = worst_pos
+                        if sWorstD is not None:
+                            sWorstD[my_row] = worst_d
+
+    # ----------------------------------------------------------------------
     # Warp-specialised device kernel
     # ----------------------------------------------------------------------
 
@@ -3362,11 +3624,18 @@ class HopperFlashKnnFused:
                 heap_max = cute.make_rmem_tensor(
                     cute.make_layout(M_per_thr), cutlass.Float32
                 )
+                # ``maxtree`` persists the worst slot per row (see the
+                # non-WS kernel for the rationale). Unused by the other
+                # strategies.
+                heap_wpos = cute.make_rmem_tensor(
+                    cute.make_layout(M_per_thr), cutlass.Int32
+                )
                 for i in cutlass.range_constexpr(M_per_thr):
                     for k in cutlass.range_constexpr(K_INTERNAL):
                         heap_d[(i, k)] = cutlass.Float32(3.4e38)
                         heap_i[(i, k)] = cutlass.Int32(-1)
                     heap_max[i] = cutlass.Float32(3.4e38)
+                    heap_wpos[i] = cutlass.Int32(0)
 
             if cutlass.const_expr(self.topk_strategy == "sortmerge"):
                 CHUNK_INTERNAL = self._next_pow2(N_per_thr)
@@ -3438,6 +3707,11 @@ class HopperFlashKnnFused:
                         dist_buf, ptPcP_mn, heap_d, heap_i, heap_max,
                         M_per_thr, N_per_thr, cta_n_offset,
                     )
+                elif cutlass.const_expr(self.topk_strategy == "maxtree"):
+                    self._chunk_topk_maxtree(
+                        dist_buf, ptPcP_mn, heap_d, heap_i, heap_max,
+                        heap_wpos, M_per_thr, N_per_thr, cta_n_offset,
+                    )
                 elif cutlass.const_expr(self.topk_strategy == "sortmerge"):
                     self._chunk_topk_sortmerge(
                         dist_buf, ptPcP_mn, heap_d, heap_i, heap_max,
@@ -3462,6 +3736,10 @@ class HopperFlashKnnFused:
             # slice; butterfly-merge across threads-in-row before write.
             if cutlass.const_expr(self.topk_strategy == "perthread"):
                 self._warp_merge_topk_perthread(
+                    tiled_mma, heap_d, heap_i, M_per_thr,
+                )
+            elif cutlass.const_expr(self.topk_strategy == "maxtree"):
+                self._warp_merge_topk_maxtree(
                     tiled_mma, heap_d, heap_i, M_per_thr,
                 )
             elif cutlass.const_expr(self.topk_strategy == "sortmerge"):
@@ -3491,7 +3769,9 @@ class HopperFlashKnnFused:
                                 ]
             else:
                 if ptPcP[0][1] == 0:
-                    if cutlass.const_expr(self.topk_strategy == "insert"):
+                    if cutlass.const_expr(
+                        self.topk_strategy in ("insert", "maxtree")
+                    ):
                         self._sort_topk_rows(heap_d, heap_i, M_per_thr, K_PAD)
                     for i in cutlass.range_constexpr(M_per_thr):
                         m_local = ptPcP_mn[(i, 0)][0]
@@ -3982,6 +4262,16 @@ class HopperFlashKnnFused:
             for k in cutlass.range_constexpr(K_PAD):
                 heap_d[(0, k)] = cutlass.Float32(3.4e38)
                 heap_i[(0, k)] = cutlass.Int32(-1)
+            # smem_maxtree: persistent (worst_d, worst_pos) for the owned
+            # row (unused by smem_perthread; compiles away).
+            heap_max = cute.make_rmem_tensor(
+                cute.make_layout(1), cutlass.Float32
+            )
+            heap_wpos = cute.make_rmem_tensor(
+                cute.make_layout(1), cutlass.Int32
+            )
+            heap_max[0] = cutlass.Float32(3.4e38)
+            heap_wpos[0] = cutlass.Int32(0)
 
             ROWS_OWNED = max(1, BM // self.num_threads_per_warp_group)
 
@@ -4004,12 +4294,20 @@ class HopperFlashKnnFused:
                     sChunkMin_stage = sChunkMin_all_a[
                         (None, dist_consumer_state_a.index)
                     ]
-                    self._chunk_topk_smem_perthread_with_chunkmin(
-                        sDist_stage, sChunkMin_stage, heap_d, heap_i,
-                        BM, BN, ROWS_OWNED,
-                        cta_m_offset, cta_n_offset, N_total, M_total,
-                        topk_tidx, sWorstD,
-                    )
+                    if cutlass.const_expr(self.topk_strategy == "smem_maxtree"):
+                        self._chunk_topk_smem_maxtree(
+                            sDist_stage, sChunkMin_stage, heap_d, heap_i,
+                            heap_max, heap_wpos, BM, BN, ROWS_OWNED,
+                            cta_m_offset, cta_n_offset, N_total, M_total,
+                            topk_tidx, sWorstD,
+                        )
+                    else:
+                        self._chunk_topk_smem_perthread_with_chunkmin(
+                            sDist_stage, sChunkMin_stage, heap_d, heap_i,
+                            BM, BN, ROWS_OWNED,
+                            cta_m_offset, cta_n_offset, N_total, M_total,
+                            topk_tidx, sWorstD,
+                        )
                     dist_pipeline_a.consumer_release(dist_consumer_state_a)
                     dist_consumer_state_a.advance()
                 else:
@@ -4020,15 +4318,28 @@ class HopperFlashKnnFused:
                     sChunkMin_stage = sChunkMin_all_b[
                         (None, dist_consumer_state_b.index)
                     ]
-                    self._chunk_topk_smem_perthread_with_chunkmin(
-                        sDist_stage, sChunkMin_stage, heap_d, heap_i,
-                        BM, BN, ROWS_OWNED,
-                        cta_m_offset, cta_n_offset, N_total, M_total,
-                        topk_tidx, sWorstD,
-                    )
+                    if cutlass.const_expr(self.topk_strategy == "smem_maxtree"):
+                        self._chunk_topk_smem_maxtree(
+                            sDist_stage, sChunkMin_stage, heap_d, heap_i,
+                            heap_max, heap_wpos, BM, BN, ROWS_OWNED,
+                            cta_m_offset, cta_n_offset, N_total, M_total,
+                            topk_tidx, sWorstD,
+                        )
+                    else:
+                        self._chunk_topk_smem_perthread_with_chunkmin(
+                            sDist_stage, sChunkMin_stage, heap_d, heap_i,
+                            BM, BN, ROWS_OWNED,
+                            cta_m_offset, cta_n_offset, N_total, M_total,
+                            topk_tidx, sWorstD,
+                        )
                     dist_pipeline_b.consumer_release(dist_consumer_state_b)
                     dist_consumer_state_b.advance()
 
+            # smem_maxtree leaves the heap UNSORTED -> selection-sort each
+            # owned row before the write (smem_perthread is already
+            # sorted by its bubble insert).
+            if cutlass.const_expr(self.topk_strategy == "smem_maxtree"):
+                self._sort_topk_rows(heap_d, heap_i, ROWS_OWNED, K_PAD)
             # Epilogue: write top-K to global. One thread per row.
             for r in cutlass.range_constexpr(ROWS_OWNED):
                 my_row = topk_tidx + r * self.num_threads_per_warp_group
@@ -4429,6 +4740,16 @@ class HopperFlashKnnFused:
             for k in cutlass.range_constexpr(K_PAD):
                 heap_d[(0, k)] = cutlass.Float32(3.4e38)
                 heap_i[(0, k)] = cutlass.Int32(-1)
+            # smem_maxtree: persistent (worst_d, worst_pos) for the owned
+            # row (unused by smem_perthread; compiles away).
+            heap_max = cute.make_rmem_tensor(
+                cute.make_layout(1), cutlass.Float32
+            )
+            heap_wpos = cute.make_rmem_tensor(
+                cute.make_layout(1), cutlass.Int32
+            )
+            heap_max[0] = cutlass.Float32(3.4e38)
+            heap_wpos[0] = cutlass.Int32(0)
 
             # ROWS_OWNED: smem_perthread normally derives this from BM /
             # 128. With WS3 the topK WG has its own 128 threads, so for
@@ -4456,15 +4777,28 @@ class HopperFlashKnnFused:
                 # avoid the fence overhead -- the next chunk's
                 # producer_commit + consumer_wait pair establishes
                 # eventual visibility for free.
-                self._chunk_topk_smem_perthread_with_chunkmin(
-                    sDist_stage, sChunkMin_stage, heap_d, heap_i,
-                    BM, BN, ROWS_OWNED,
-                    cta_m_offset, cta_n_offset, N_total, M_total,
-                    topk_tidx, sWorstD,
-                )
+                if cutlass.const_expr(self.topk_strategy == "smem_maxtree"):
+                    self._chunk_topk_smem_maxtree(
+                        sDist_stage, sChunkMin_stage, heap_d, heap_i,
+                        heap_max, heap_wpos, BM, BN, ROWS_OWNED,
+                        cta_m_offset, cta_n_offset, N_total, M_total,
+                        topk_tidx, sWorstD,
+                    )
+                else:
+                    self._chunk_topk_smem_perthread_with_chunkmin(
+                        sDist_stage, sChunkMin_stage, heap_d, heap_i,
+                        BM, BN, ROWS_OWNED,
+                        cta_m_offset, cta_n_offset, N_total, M_total,
+                        topk_tidx, sWorstD,
+                    )
                 dist_pipeline.consumer_release(dist_consumer_state)
                 dist_consumer_state.advance()
 
+            # smem_maxtree leaves the heap UNSORTED -> selection-sort each
+            # owned row before the write (smem_perthread is already
+            # sorted by its bubble insert).
+            if cutlass.const_expr(self.topk_strategy == "smem_maxtree"):
+                self._sort_topk_rows(heap_d, heap_i, ROWS_OWNED, K_PAD)
             # Epilogue: write top-K to global. One thread per row.
             for r in cutlass.range_constexpr(ROWS_OWNED):
                 my_row = topk_tidx + r * self.num_threads_per_warp_group

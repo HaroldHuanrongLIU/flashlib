@@ -1,6 +1,6 @@
 """Blackwell (sm_100) CuteDSL flash-KNN kernels (BF16, D=128).
 
-Two specialized kernels, mirroring flashlib-cake's design, targeting the
+Two specialized kernels, implementing the maxtree top-K design, targeting the
 regimes where flashlib's Triton path is weakest on B200 / Triton 3.4:
 
 * :class:`BlackwellKnnBuild` -- self-kNN / large-Q "build" via ``tcgen05``
@@ -168,7 +168,7 @@ if _BW_AVAILABLE:
             self.num_ab_stage = 2
             self.threads_per_cta = 128
 
-        # ---- reusable device-side top-K (cake-style), @cute.jit-inlined ----
+        # ---- reusable device-side top-K (maxtree-style), @cute.jit-inlined ----
         # Factored out of the kernel body so build/search/fused variants can
         # share one tuned implementation. These are preprocessed + inlined at
         # trace time (zero runtime cost vs hand-inlining). Rules: mutable rmem
@@ -408,7 +408,7 @@ if _BW_AVAILABLE:
 
             tmem.relinquish_alloc_permit()
 
-            # per-thread running top-K (cake-style), via reusable device helper.
+            # per-thread running top-K (maxtree-style), via reusable device helper.
             best_d, best_i, worst_d, worst_pos = self._topk_init(K)
 
             tiles_per_split = n_db_tiles // num_splits
@@ -484,7 +484,7 @@ if _BW_AVAILABLE:
                         acc_pipeline.producer_commit(acc_prod)
                         acc_prod.advance()
 
-                # cake-style top-K update (group-min skip + max-tree recompute),
+                # maxtree-style top-K update (group-min skip + max-tree recompute),
                 # via the reusable device helper.
                 base = db * BLOCK_N
                 frag = tTR_rAcc.load()
@@ -629,11 +629,11 @@ _SEARCH_CACHE: dict = {}
 
 
 # Per-split retained-K cap. For k>KEEP_CAP at large N we keep only the top
-# KEEP_CAP per split (cake's k10t32 strategy) and recover the true top-k in the
+# KEEP_CAP per split (maxtree's k10t32 strategy) and recover the true top-k in the
 # merge over S*KEEP_CAP candidates. This keeps the hot top-K array in registers
 # -- CuteDSL spills larger per-thread arrays to local memory (the worst
 # recompute then does O(K) local loads/insertion, ~linear slowdown), whereas
-# nvcc keeps cake's full-K array in registers. Below SMALL_N_EXACT, full-k per
+# nvcc keeps maxtree's full-K array in registers. Below SMALL_N_EXACT, full-k per
 # split is cheap enough that we stay exact.
 KEEP_CAP = 5
 SMALL_N_EXACT = 2048
@@ -658,7 +658,7 @@ def pick_splits_build(N: int, target_ctas: int = 300) -> int:
 
 def choose_build_config(N: int, k: int):
     """Pick (k_keep, num_splits) for the build. Exact (k_keep==k) when
-    k<=KEEP_CAP or (small N and moderate k); else cake-style k_keep=KEEP_CAP
+    k<=KEEP_CAP or (small N and moderate k); else maxtree-style k_keep=KEEP_CAP
     with fine splits."""
     n_db_tiles = N // BLOCK_N
     if k <= KEEP_CAP or (N <= SMALL_N_EXACT and k <= 10):
@@ -693,7 +693,7 @@ def knn_build_cutedsl(x: torch.Tensor, k: int, *, num_splits=None,
     """Self-kNN build for x:(N,D) bf16, D=128. Returns idx (N,k) i32 (and
     dist (N,k) f32 when ``return_distances``).
 
-    For k>KEEP_CAP at large N the default keeps top-KEEP_CAP per split (cake's
+    For k>KEEP_CAP at large N the default keeps top-KEEP_CAP per split (maxtree's
     k10t32 strategy: registers-only hot top-K, recall ~1.0). ``exact=True``
     forces full-k per split (guaranteed recall 1.0, ~2-3x slower at large N due
     to a CuteDSL local-memory spill the CUDA path avoids)."""

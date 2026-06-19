@@ -21,9 +21,11 @@ Backends
 
   Never materialises an N×M cross matrix to HBM and never loads
   ``x_sq``; both are hard contracts.
-* ``backend="cutedsl"``  -- Hopper FA3-style fully-fused. Opt-in only
-  (first call per shape pays a CuteDSL compile). Falls back to Triton
-  when the shape sits outside the FA3 sweet spot or compile fails.
+* ``backend="cutedsl"``  -- CuteDSL fully-fused. The backend axis is
+  DSL-only; the router auto-selects the kernel by hardware: Hopper
+  (sm_90) runs the FA3 ``hopper_impl``, Blackwell (sm_100) runs
+  ``blackwell_impl``. Opt-in only (first call per shape pays a CuteDSL
+  compile). Falls back to Triton on failure.
 * ``backend="torch"``    -- pure-torch reference (CPU OK, slow).
 
 No ``variant`` axis: callers don't pick between build / search /
@@ -62,12 +64,19 @@ def _route(
         small-N vs large-N inside the dispatcher).
       * else            -> ``"torch"``.
 
-    CuteDSL FA3 is never auto-routed; it is only reachable via the
+    CuteDSL is never auto-routed by shape; it is only reachable via the
     explicit ``backend="cutedsl"`` override -- the multi-minute first
     call autotune (and the lighter ~5-8 s heuristic compile) makes
-    silent substitution surprising.
+    silent substitution surprising. (The one exception is the
+    transparent sm_100 small-Q fast-path in :func:`flash_knn_dispatch`,
+    a regime Triton cannot compile at all.)
     """
     if backend is not None:
+        if backend not in _VALID_BACKENDS:
+            raise ValueError(
+                f"backend must be one of {_VALID_BACKENDS} or None, "
+                f"got {backend!r}"
+            )
         return backend
     hw = hw or _hw.current()
     if not hw.is_cuda:
@@ -75,24 +84,29 @@ def _route(
     return "triton"
 
 
+# Backends are DSL-only: the hardware (Hopper vs Blackwell) is NOT a
+# backend -- the router picks the matching CuteDSL kernel by hardware
+# inside ``_cutedsl_knn``.
+_VALID_BACKENDS = ("triton", "cutedsl", "torch")
+
 _OP_NAME = {
     "triton":  "knn_triton",
     "cutedsl": "knn_cutedsl_fa3",
-    "blackwell": "knn_cutedsl_blackwell",
     "torch":   "knn_torch",
 }
 
 # Small-Q threshold below which Triton's tl.dot (min M=16) cannot run on
-# sm_100 -- the Blackwell CuteDSL search kernel is auto-routed there.
-_BLACKWELL_SMALLQ = 16
+# sm_100 -- the CuteDSL backend (Blackwell kernel) is auto-routed there.
+_CUTEDSL_SMALLQ = 16
 
 
-def _blackwell_autopick(x: torch.Tensor, c: torch.Tensor, k: int,
-                        hw: _hw.HwProps) -> bool:
-    """Whether to transparently use the Blackwell CuteDSL KNN kernel instead
-    of Triton. Only fires in the regime Triton can't serve: small-Q search
-    on sm_100, BF16/D=128, single batch (restores a working path *and* wins).
-    Build / large-Q stay on Triton (already competitive)."""
+def _cutedsl_autopick(x: torch.Tensor, c: torch.Tensor, k: int,
+                      hw: _hw.HwProps) -> bool:
+    """Whether to transparently route to the CuteDSL backend instead of
+    Triton. Only fires where Triton can't serve the shape: small-Q search
+    on sm_100 (Triton's ``tl.dot`` needs M>=16), BF16/D=128, single batch
+    -- where the Blackwell CuteDSL search kernel both restores a working
+    path *and* wins. Build / large-Q stay on Triton (already competitive)."""
     if not hw.is_blackwell:
         return False
     B, N, Dd = x.shape
@@ -103,15 +117,33 @@ def _blackwell_autopick(x: torch.Tensor, c: torch.Tensor, k: int,
         return False
     is_build = (x.data_ptr() == c.data_ptr() and N == M)
     if is_build:
-        return False  # large-Q build: Triton/cake territory, keep Triton
-    if N >= _BLACKWELL_SMALLQ:
-        return False  # Triton's MMA-batched search already beats cake here
+        return False  # large-Q build stays on Triton
+    if N >= _CUTEDSL_SMALLQ:
+        return False  # Triton's MMA-batched search already wins here
     try:
-        from flashlib.primitives.knn.cutedsl.blackwell_fused import (
+        from flashlib.primitives.knn.cutedsl.blackwell_impl import (
             blackwell_supported)
     except Exception:  # noqa: BLE001
         return False
     return blackwell_supported(x, c, k)
+
+
+def _cutedsl_knn(x: torch.Tensor, c: torch.Tensor, k: int,
+                 hw: _hw.HwProps, **kwargs) -> torch.Tensor:
+    """Run the CuteDSL KNN backend, auto-selecting the kernel by hardware.
+
+    The ``"cutedsl"`` backend is DSL-only; the concrete kernel is chosen
+    here from :class:`flashlib._hw.HwProps`:
+
+      * Blackwell (sm_100) -> :mod:`...cutedsl.blackwell_impl`.
+      * Hopper    (sm_90)  -> the FA3 :mod:`...cutedsl.hopper_impl`
+        (via :func:`cutedsl_flash_knn`).
+    """
+    if hw.is_blackwell:
+        from flashlib.primitives.knn.cutedsl.blackwell_impl import (
+            blackwell_flash_knn)
+        return blackwell_flash_knn(x, c, k)
+    return cutedsl_flash_knn(x, c, k, **kwargs)
 
 
 def route_op_name(*, B: int, N: int, M: int, D: int, k: int,
@@ -217,24 +249,21 @@ def flash_knn_dispatch(
 
     x_p, c_p = _prepare_inputs(x, c)
 
-    # Transparent Blackwell CuteDSL fast-path: only when explicitly requested or
-    # when Triton cannot serve the shape (small-Q search on sm_100). Any failure
-    # falls back to Triton so behaviour is never worse than the default.
-    use_blackwell = (chosen == "blackwell")
-    if chosen != "blackwell" and backend is None:
-        use_blackwell = _blackwell_autopick(x_p, c_p, k,
-                                             _hw.current())
-    if use_blackwell:
+    # CuteDSL backend (DSL-only; the kernel is hardware-routed in
+    # ``_cutedsl_knn``). Used when explicitly requested (backend="cutedsl")
+    # or, transparently, on the sm_100 small-Q shape Triton cannot compile.
+    # Any failure falls back to Triton so behaviour is never worse.
+    hw = _hw.current()
+    use_cutedsl = (chosen == "cutedsl")
+    if backend is None and chosen == "triton":
+        use_cutedsl = _cutedsl_autopick(x_p, c_p, k, hw)
+    if use_cutedsl:
         try:
-            from flashlib.primitives.knn.cutedsl.blackwell_fused import (
-                blackwell_flash_knn)
-            idxs = blackwell_flash_knn(x_p, c_p, k)
+            idxs = _cutedsl_knn(x_p, c_p, k, hw, **kwargs)
         except Exception:  # noqa: BLE001 - never regress below Triton
-            if chosen == "blackwell":
+            if chosen == "cutedsl":
                 raise
             idxs = flash_knn_triton(x_p, c_p, k, **kwargs)
-    elif chosen == "cutedsl":
-        idxs = cutedsl_flash_knn(x_p, c_p, k, **kwargs)
     else:
         idxs = flash_knn_triton(x_p, c_p, k, **kwargs)
 

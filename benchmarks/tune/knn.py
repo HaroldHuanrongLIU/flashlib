@@ -50,7 +50,7 @@ from benchmarks.tune._common import expand_grid, parse_argv, run_tuner
 # so the sweep terminates reliably.
 
 def _patch_fa3_autotune_skip_bm256():
-    from flashlib.primitives.knn.cutedsl.fused_kernel import HopperFlashKnnFused
+    from flashlib.primitives.knn.cutedsl.hopper_impl import HopperFlashKnnFused
     orig_init = HopperFlashKnnFused.__init__
 
     def _patched_init(self, *args, **kwargs):

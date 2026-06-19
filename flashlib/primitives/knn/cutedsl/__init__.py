@@ -5,7 +5,7 @@ the dispatcher / cost model. The only kernel here is the x^2-free fused
 FA3 path (see :mod:`flashlib.primitives.knn.cutedsl.impl` for the design
 rationale).
 """
-from flashlib.primitives.knn.cutedsl.fused_kernel import (
+from flashlib.primitives.knn.cutedsl.hopper_impl import (
     _cmp_swap_asc_packed_ptx,
     HopperFlashKnnFused,
 )
@@ -19,7 +19,7 @@ from flashlib.primitives.knn.cutedsl.impl import (
     cutedsl_available,
     cutedsl_flash_knn,
 )
-from flashlib.primitives.knn.cutedsl.blackwell_fused import (
+from flashlib.primitives.knn.cutedsl.blackwell_impl import (
     blackwell_available,
     blackwell_supported,
     blackwell_flash_knn,
