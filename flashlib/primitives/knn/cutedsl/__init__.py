@@ -18,6 +18,7 @@ from flashlib.primitives.knn.cutedsl.impl import (
     _cached_from_dlpack,
     cutedsl_available,
     cutedsl_flash_knn,
+    CuteDSLUnsupported,
 )
 from flashlib.primitives.knn.cutedsl.blackwell_impl import (
     blackwell_available,
@@ -31,6 +32,7 @@ __all__ = [
     "HopperFlashKnnFused",
     "cutedsl_available",
     "cutedsl_flash_knn",
+    "CuteDSLUnsupported",
     "blackwell_available",
     "blackwell_supported",
     "blackwell_flash_knn",

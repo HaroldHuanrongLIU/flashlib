@@ -572,7 +572,7 @@ def _rows_set_equal(a, b):
 
 
 @pytest.mark.skipif(not _hopper_cutedsl(), reason="Hopper + CUTLASS DSL required")
-@pytest.mark.parametrize("K", [4, 16])
+@pytest.mark.parametrize("K", [4, 12, 16])
 def test_maxtree_topk_parity(K):
     """The ported maxtree top-K must return the SAME top-K neighbour set as the
     strategy it replaces (both are exact; only equal-distance tie order may
@@ -580,6 +580,10 @@ def test_maxtree_topk_parity(K):
 
       * register  : ``maxtree``      vs ``perthread``      (non-WS)
       * 1-per-row : ``smem_maxtree`` vs ``smem_perthread`` (WS3)
+
+    K spans both worst-of-K branches of ``_worst_row``: K=4 the balanced
+    max-tree, K=12/16 the streaming running-max (the Blackwell BUILD learning,
+    used at K>=11 to dodge the max-tree's MLIR register spill).
     """
     torch.manual_seed(0)
     N, M, D = 512, 4096, 64

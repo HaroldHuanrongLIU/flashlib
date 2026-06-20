@@ -297,6 +297,81 @@ def test_knn_flash_auto_routes_smallq_to_blackwell():
     assert (vals[:, 1:] >= vals[:, :-1] - 1e-3).all()
 
 
+def _hopper_sm90() -> bool:
+    return _is_hopper() and not _is_blackwell()
+
+
+@pytest.mark.skipif(not _hopper_sm90(), reason="Hopper sm_90 FA3 path")
+@pytest.mark.parametrize("q", [1, 4, 8, 13, 100])
+def test_knn_cutedsl_fa3_smallq_search_exact(q):
+    """FA3 search kernel handles partial / small query tiles (Q not a multiple
+    of BM). This is the query-pad fix that replaced the previous OOB illegal
+    instruction; recall must be exactly 1.0 vs the fp32 top-K."""
+    _seeded(q * 5 + 3)
+    from flashlib.primitives.knn.cutedsl import cutedsl_available
+    from flashlib.primitives.knn.cutedsl.impl import cutedsl_flash_knn
+    if not cutedsl_available():
+        pytest.skip("cutlass-dsl / cuda-python unavailable")
+    qx = torch.randn(q, 128, device=DEVICE, dtype=torch.bfloat16)
+    db = torch.randn(8192, 128, device=DEVICE, dtype=torch.bfloat16)
+    idx = cutedsl_flash_knn(qx.unsqueeze(0), db.unsqueeze(0), 8)[0]
+    torch.cuda.synchronize()
+    ri = _exact_idx(qx, db, 8)
+    recall = (idx.long().unsqueeze(-1) == ri.unsqueeze(-2)).any(-1).float().mean()
+    assert recall.item() == 1.0, f"smallq search recall {recall.item():.4f}"
+    assert idx.dtype == torch.int32 and tuple(idx.shape) == (q, 8)
+
+
+@pytest.mark.skipif(not _hopper_sm90(), reason="Hopper sm_90 build auto-route")
+def test_knn_autopick_hopper_build_band():
+    """Lock the Hopper transparent-routing policy: large-N low/mid-k self-kNN
+    builds auto-route to CuteDSL (1.4-2.4x); high-k, narrow-N, wide-D, and any
+    search shape stay on Triton."""
+    import flashlib.primitives.knn.impl as kimpl
+    from flashlib import _hw
+    hw = _hw.current()
+
+    def pick(N, D, K, *, build=True, M=None):
+        x = torch.empty(1, N, D, device=DEVICE, dtype=torch.bfloat16)
+        c = x if build else torch.empty(1, M or N, D, device=DEVICE,
+                                        dtype=torch.bfloat16)
+        return kimpl._cutedsl_autopick(x, c, K, hw)
+
+    assert pick(131072, 64, 8) is True
+    assert pick(131072, 128, 20) is True
+    assert pick(131072, 64, 24) is False                 # k > kmax
+    assert pick(131072, 256, 8) is False                 # D > 128
+    assert pick(40000, 64, 8) is False                   # N < 50k
+    assert pick(8, 64, 8, build=False, M=131072) is False  # search
+
+
+@pytest.mark.skipif(not _hopper_sm90(), reason="Hopper sm_90 strict routing")
+def test_knn_flash_strict_no_cross_backend_fallback():
+    """Routing is strict and proactive: the dispatcher picks exactly one
+    backend up front and runs it -- there is NO reactive cross-backend net.
+    If the chosen backend fails, the error propagates (pin the other backend
+    to recover). (Small-Q on sm_90 is a non-issue -- Triton tiles every Q;
+    the sm_100 small-Q gap is handled proactively by ``_cutedsl_autopick``.)"""
+    _seeded()
+    import flashlib.primitives.knn.impl as kimpl
+    from flashlib.primitives.knn import flash_knn
+    q = torch.randn(8, 128, device=DEVICE, dtype=torch.bfloat16)
+    c = torch.randn(8192, 128, device=DEVICE, dtype=torch.bfloat16)
+    orig = kimpl.flash_knn_triton
+
+    def boom(*a, **k):
+        raise RuntimeError("simulated triton failure")
+
+    # auto routes this Hopper search shape to Triton; with no reactive net the
+    # failure surfaces instead of silently swapping to CuteDSL.
+    kimpl.flash_knn_triton = boom
+    try:
+        with pytest.raises(RuntimeError):
+            flash_knn(q, c, 8, return_distances=False)
+    finally:
+        kimpl.flash_knn_triton = orig
+
+
 # ---------------------------------------------------------------------------
 # Standard scaler — element-wise within fp16 tol
 # ---------------------------------------------------------------------------

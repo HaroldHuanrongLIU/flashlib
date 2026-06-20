@@ -475,6 +475,7 @@ from __future__ import annotations
 from typing import Tuple, Type
 
 import math
+import os
 
 import cuda.bindings.driver as cuda
 
@@ -644,6 +645,12 @@ def _cmp_swap_asc_packed_ptx(pa, pb):
     p_min = cutlass.Int64(_llvm.extractvalue(_mlir_types.i64(), res, [0]))
     p_max = cutlass.Int64(_llvm.extractvalue(_mlir_types.i64(), res, [1]))
     return p_min, p_max
+
+
+# maxtree worst-of-K: K at/above which the streaming running-max beats the
+# balanced max-tree (the max-tree's K live leaves spill in CuteDSL/MLIR). H100
+# router-tile crossover; see ``HopperFlashKnnFused._worst_row``.
+_MAXTREE_STREAM_KMIN = 11
 
 
 class HopperFlashKnnFused:
@@ -818,6 +825,14 @@ class HopperFlashKnnFused:
 
         self.use_ws = bool(use_ws)
         self.use_ws3 = bool(use_ws3)
+        # maxtree worst-of-K recompute mode. "auto" (default): K-adaptive --
+        # the streaming running-max (2 live scalars) for K>=_MAXTREE_STREAM_KMIN
+        # where the balanced max-tree's K live leaves spill in CuteDSL/MLIR,
+        # else the shallower max-tree. (The Blackwell BUILD kernel hit the same
+        # spill and switched to streaming; Hopper rides the same MLIR backend.)
+        # "0"/"1" pin tree/stream for A/B.
+        self._worst_stream_mode = os.environ.get(
+            "FLASHLIB_KNN_WORST_STREAM", "auto")
         # Optimization B: WS4 architecture (2 GEMM warpgroups + 1
         # TopK warpgroup + 1 Load warpgroup). Each GEMM WG runs on
         # a different SM sub-partition's WGMMA pipe, so the GEMM
@@ -3227,14 +3242,18 @@ class HopperFlashKnnFused:
     #   * group-min-4 prune: scan candidates 4 at a time; if even the min
     #     of the 4 can't beat ``worst_d``, skip all 4 with ONE compare
     #     (vs 1 compare/element for the sorted path).
-    #   * balanced max-tree: recompute the evict slot in O(log K) depth
-    #     after each insert (vs the O(K) sorted-bubble carry).
+    #   * worst-of-K recompute (``_worst_row``, K-adaptive): refresh the
+    #     evict slot after each insert. K<=10 uses a balanced max-tree
+    #     (O(log K) depth); K>=11 uses a streaming running-max (O(K)
+    #     compares but only 2 live scalars) because the max-tree's K live
+    #     leaves spill in CuteDSL/MLIR at higher K -- the Blackwell BUILD
+    #     learning (see ``blackwell_impl._worst_of``).
     # ``(worst_d, worst_pos)`` persist across chunks in small constexpr-
     # indexed register arrays (``heap_max`` / ``heap_wpos``), so a fully
     # pruned chunk touches the heap zero times. The heap stays unsorted in
     # the mainloop; a one-shot selection sort in the epilogue restores
     # ascending order before the GMEM write. See ``blackwell_impl.py``
-    # (``_topk_init`` / ``_worst_tree`` / ``_topk_consume_tile``) for the
+    # (``_topk_init`` / ``_worst_of`` / ``_topk_consume_tile``) for the
     # sm_100 original.
 
     @cute.jit
@@ -3264,13 +3283,66 @@ class HopperFlashKnnFused:
         return items[0]
 
     @cute.jit
+    def _worst_of_row(
+        self, heap_d, row: cutlass.Constexpr, K: cutlass.Constexpr,
+    ):
+        """Streaming running-max worst-of-K over ``heap_d[row, :]`` ->
+        (worst_d, worst_pos).
+
+        Only two scalars (``worst_d`` / ``worst_pos``) stay live across the
+        unrolled scan, vs the balanced ``_worst_tree_row`` which materialises
+        all K (value, pos) leaves into SSA at once. Ported from the Blackwell
+        BUILD kernel's ``_worst_of`` (``blackwell_impl.py``): there the
+        max-tree -- K live leaves stacked on the MMA fragment -- makes MLIR
+        spill and runs ~2x slower even at K=5/10, while the streaming scan
+        keeps occupancy high. Hopper rides the same MLIR backend, so the same
+        swap applies. O(K) compares, but it only runs on the rare insert that
+        survives the group-min-4 prune, so the local-memory loads stay
+        L1-resident and cheap."""
+        worst_d = heap_d[(row, 0)]
+        worst_pos = cutlass.Int32(0)
+        for jj in cutlass.range_constexpr(K - 1):
+            j = jj + 1
+            cur = heap_d[(row, j)]
+            gt = cur > worst_d
+            worst_d = cutlass.select_(gt, cur, worst_d)
+            worst_pos = cutlass.select_(gt, cutlass.Int32(j), worst_pos)
+        return worst_d, worst_pos
+
+    @cute.jit
+    def _worst_row(
+        self, heap_d, row: cutlass.Constexpr, K: cutlass.Constexpr,
+    ):
+        """Recompute ``(worst_d, worst_pos)`` over the unsorted heap row.
+
+        K-adaptive (mode "auto", default): the streaming scan keeps 2 scalars
+        live and wins once the balanced max-tree's K leaves start spilling.
+        Measured crossover on H100 is K~11 at the router tile (BM256/BN64):
+        K<=10 the shallower max-tree dependency chain is faster; K>=12 the
+        max-tree spills and streaming is up to ~1.6x faster -- it recovers the
+        build win the max-tree gives back to the spill (K=16: 0.78x->1.23x vs
+        the sorted ``perthread``). ``FLASHLIB_KNN_WORST_STREAM=0/1`` pins
+        tree/stream for A/B."""
+        mode = self._worst_stream_mode
+        if cutlass.const_expr(mode == "0"):
+            stream = False
+        elif cutlass.const_expr(mode == "1"):
+            stream = True
+        else:
+            stream = cutlass.const_expr(K >= _MAXTREE_STREAM_KMIN)
+        if cutlass.const_expr(stream):
+            return self._worst_of_row(heap_d, row, K)
+        return self._worst_tree_row(heap_d, row, K)
+
+    @cute.jit
     def _maxtree_insert(
         self, heap_d, heap_i, row: cutlass.Constexpr, K: cutlass.Constexpr,
         worst_pos, c_d, c_i,
     ):
         """Evict the current worst entry with the candidate, then refresh
-        ``(worst_d, worst_pos)`` via the max-tree. Caller guarantees
-        ``c_d < worst_d``. Returns the refreshed ``(worst_d, worst_pos)``.
+        ``(worst_d, worst_pos)`` via ``_worst_row`` (K-adaptive streaming
+        scan / max-tree). Caller guarantees ``c_d < worst_d``. Returns the
+        refreshed ``(worst_d, worst_pos)``.
 
         The dynamic store ``heap_d[row, worst_pos]`` is intentional: an
         O(K) predicated-write loop that keeps the heap register-resident
@@ -3279,7 +3351,7 @@ class HopperFlashKnnFused:
         rare inserts that survive the group-min prune."""
         heap_d[(row, worst_pos)] = c_d
         heap_i[(row, worst_pos)] = c_i
-        return self._worst_tree_row(heap_d, row, K)
+        return self._worst_row(heap_d, row, K)
 
     @cute.jit
     def _chunk_topk_maxtree(
@@ -3363,7 +3435,7 @@ class HopperFlashKnnFused:
                             heap_i[(i, kk)],
                             offset=offset, mask=-1, mask_and_clamp=31,
                         )
-                    worst_d, worst_pos = self._worst_tree_row(heap_d, i, K)
+                    worst_d, worst_pos = self._worst_row(heap_d, i, K)
                     for kk in cutlass.range_constexpr(K):
                         c_d = peer_d_buf[kk]
                         c_i = peer_i_buf[kk]

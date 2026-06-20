@@ -24,8 +24,15 @@ Backends
 * ``backend="cutedsl"``  -- CuteDSL fully-fused. The backend axis is
   DSL-only; the router auto-selects the kernel by hardware: Hopper
   (sm_90) runs the FA3 ``hopper_impl``, Blackwell (sm_100) runs
-  ``blackwell_impl``. Opt-in only (first call per shape pays a CuteDSL
-  compile). Falls back to Triton on failure.
+  ``blackwell_impl``. Reachable two ways: the explicit override; and the
+  transparent advantage-shape auto-route (large-N build on both archs +
+  sm_100 small-Q search Triton can't tile; see :func:`_cutedsl_autopick`).
+  The first call per shape pays a CuteDSL compile. Routing is *strict and
+  proactive*: the dispatcher picks one backend up front and runs it -- there
+  is no cross-backend fallback. The kernel is a *pure executor*
+  (:func:`...cutedsl.cutedsl_flash_knn`) that raises ``CuteDSLUnsupported``
+  rather than delegating, so an explicit ``backend="cutedsl"`` on a shape it
+  can't run surfaces the error (no silent swap to Triton).
 * ``backend="torch"``    -- pure-torch reference (CPU OK, slow).
 
 No ``variant`` axis: callers don't pick between build / search /
@@ -40,7 +47,7 @@ import torch
 
 from flashlib import _hw
 from flashlib.kernels.distance.triton.knn_gather_l2sq import triton_knn_gather_sqdist
-from flashlib.primitives.knn.cutedsl import cutedsl_flash_knn
+from flashlib.primitives.knn.cutedsl import cutedsl_available, cutedsl_flash_knn
 from flashlib.primitives.knn.torch_fallback import knn_torch_naive
 from flashlib.primitives.knn.triton.dispatch import flash_knn_triton
 
@@ -64,12 +71,15 @@ def _route(
         small-N vs large-N inside the dispatcher).
       * else            -> ``"torch"``.
 
-    CuteDSL is never auto-routed by shape; it is only reachable via the
-    explicit ``backend="cutedsl"`` override -- the multi-minute first
-    call autotune (and the lighter ~5-8 s heuristic compile) makes
-    silent substitution surprising. (The one exception is the
-    transparent sm_100 small-Q fast-path in :func:`flash_knn_dispatch`,
-    a regime Triton cannot compile at all.)
+    This rule returns the *baseline* backend. The CuteDSL advantage shapes
+    are layered on top of it in :func:`flash_knn_dispatch` via
+    :func:`_cutedsl_autopick` (so the cost model, which only sees ``_route``,
+    still treats Triton as the default). CuteDSL is transparently substituted
+    only where it clearly wins or where Triton cannot run at all -- the
+    large-N build band (both archs) and the sm_100 small-Q search Triton
+    cannot compile. Every other shape stays on Triton unless the caller opts
+    in with ``backend="cutedsl"``; the first such call pays a one-off CuteDSL
+    compile (~5-8 s heuristic, multi-minute autotune).
     """
     if backend is not None:
         if backend not in _VALID_BACKENDS:
@@ -106,43 +116,86 @@ _CUTEDSL_SMALLQ = 16
 # high-k builds stay on Triton. (Measured B200 ours-vs-Triton crossover sweep.)
 _CUTEDSL_BUILD_KMAX = 20
 
+# Hopper FA3 *build* auto-route band (measured H100 cutedsl-vs-triton, bf16;
+# see benchmarks/results/micro_knn_maxtree_topk.md). The fully-fused TMA+WGMMA
+# build (with the maxtree register top-K) beats the Triton build 1.4-2.4x
+# across D<=128, N>=50k, k in [4, ~22]; Triton catches up at k>=24 (its build is
+# MMA-bound, ~flat in k). Cap at k<=20 for a solid margin (k=20 ~1.38x; k=22
+# only ~1.08x). Search is NOT auto-routed on Hopper: Triton wins small/mid-Q
+# search by up to ~12x (FA3 warp-per-row epilogue is starved until Q~8k), and
+# Triton tiles every Q on sm_90 (verified Q=1..64 exact) so there is nothing
+# to catch -- no reactive net is needed here.
+_HOPPER_BUILD_KMAX = 20
+_HOPPER_BUILD_NMIN = 50_000
+_HOPPER_BUILD_DMAX = 128
+
 
 def _cutedsl_autopick(x: torch.Tensor, c: torch.Tensor, k: int,
                       hw: _hw.HwProps) -> bool:
-    """Whether to transparently route to the CuteDSL Blackwell backend instead
-    of Triton. BF16 / D=128 / single batch on sm_100 only. Two regimes win:
+    """Whether to transparently route to the CuteDSL backend instead of Triton.
+    The concrete kernel is hardware-routed in :func:`_cutedsl_knn` (Hopper FA3
+    / Blackwell). All regimes are bf16, single batch. This is the *single
+    source of truth* for the auto path -- routing is strict (no cross-backend
+    fallback), so this only returns ``True`` on shapes CuteDSL is known to run
+    and win on (or, on sm_100, the small-Q search Triton physically can't tile).
 
+    Blackwell (sm_100), D=128:
       * build (self-kNN, k<=``_CUTEDSL_BUILD_KMAX``): the tcgen05 split-K +
-        register top-K build beats Triton 2-3x and cake 1.3-3x at large N. High
-        k stays on Triton (top-K-bound there; Triton ~ties cake).
+        register top-K build beats Triton 2-3x at large N. High k stays on
+        Triton (top-K O(k^2) crosses over; Triton MMA-bound, ~flat in k).
       * search (small-Q, N<``_CUTEDSL_SMALLQ``): Triton's ``tl.dot`` needs M>=16
-        so it can't even run; the CuteDSL search kernel restores it *and* wins.
+        so it can't even run; the Blackwell search kernel restores it *and*
+        wins.
 
-    Any failure falls back to Triton, so routing here never regresses."""
-    if not hw.is_blackwell:
+    Hopper (sm_90), D<=``_HOPPER_BUILD_DMAX``:
+      * build (self-kNN, N>=``_HOPPER_BUILD_NMIN``, k<=``_HOPPER_BUILD_KMAX``):
+        the FA3 fully-fused build beats the Triton build 1.4-2.4x. Search is
+        left on Triton (it wins small/mid-Q by up to ~12x and tiles every Q on
+        sm_90, so there is no small-Q gap to route around on Hopper).
+    """
+    if not hw.is_cuda:
         return False
     B, N, Dd = x.shape
     M = c.shape[1]
-    if B != 1 or Dd != 128 or k > 64:
+    if B != 1 or k > 64:
         return False
     if x.dtype != torch.bfloat16 or c.dtype != torch.bfloat16:
         return False
-    try:
-        from flashlib.primitives.knn.cutedsl.blackwell_impl import (
-            blackwell_supported)
-    except Exception:  # noqa: BLE001
-        return False
     is_build = (x.data_ptr() == c.data_ptr() and N == M)
-    if is_build:
-        # CuteDSL build wins for small/mid k; high-k top-K is O(k^2) and loses
-        # to Triton (MMA-bound, ~flat in k), which already matches cake there.
-        if k > _CUTEDSL_BUILD_KMAX:
+
+    if hw.is_blackwell:
+        if Dd != 128:
+            return False
+        try:
+            from flashlib.primitives.knn.cutedsl.blackwell_impl import (
+                blackwell_supported)
+        except Exception:  # noqa: BLE001
+            return False
+        if is_build:
+            # CuteDSL build wins for small/mid k; high-k top-K is O(k^2) and
+            # loses to Triton (MMA-bound, ~flat in k), which matches cake there.
+            if k > _CUTEDSL_BUILD_KMAX:
+                return False
+            return blackwell_supported(x, c, k)
+        # search: only where Triton's MMA-batched path can't run (small Q).
+        if N >= _CUTEDSL_SMALLQ:
             return False
         return blackwell_supported(x, c, k)
-    # search: only where Triton's MMA-batched path can't run (small Q).
-    if N >= _CUTEDSL_SMALLQ:
-        return False
-    return blackwell_supported(x, c, k)
+
+    if hw.is_hopper:
+        # Only the large-N build band is a transparent win on Hopper. Search
+        # stays on Triton (it wins small/mid-Q and tiles every Q on sm_90); the
+        # very-large-Q FA3 search win is left opt-in to avoid the silent compile
+        # tax on the common small-Q shape.
+        if not is_build:
+            return False
+        if Dd % 16 != 0 or Dd > _HOPPER_BUILD_DMAX:
+            return False
+        if N < _HOPPER_BUILD_NMIN or k > _HOPPER_BUILD_KMAX:
+            return False
+        return cutedsl_available()
+
+    return False
 
 
 def _cutedsl_knn(x: torch.Tensor, c: torch.Tensor, k: int,
@@ -266,21 +319,18 @@ def flash_knn_dispatch(
 
     x_p, c_p = _prepare_inputs(x, c)
 
-    # CuteDSL backend (DSL-only; the kernel is hardware-routed in
-    # ``_cutedsl_knn``). Used when explicitly requested (backend="cutedsl")
-    # or, transparently, on the sm_100 small-Q shape Triton cannot compile.
-    # Any failure falls back to Triton so behaviour is never worse.
+    # Strict, proactive routing: pick exactly one backend and run it. The
+    # decision is made once here -- there is no cross-backend fallback. For
+    # auto (backend=None), ``_cutedsl_autopick`` is the single source of truth
+    # and only upgrades Triton->CuteDSL on the measured advantage shapes (and,
+    # on sm_100, the small-Q search Triton can't tile -- handled *proactively*,
+    # not caught after the fact). An explicit backend runs or raises.
     hw = _hw.current()
     use_cutedsl = (chosen == "cutedsl")
     if backend is None and chosen == "triton":
         use_cutedsl = _cutedsl_autopick(x_p, c_p, k, hw)
     if use_cutedsl:
-        try:
-            idxs = _cutedsl_knn(x_p, c_p, k, hw, **kwargs)
-        except Exception:  # noqa: BLE001 - never regress below Triton
-            if chosen == "cutedsl":
-                raise
-            idxs = flash_knn_triton(x_p, c_p, k, **kwargs)
+        idxs = _cutedsl_knn(x_p, c_p, k, hw, **kwargs)
     else:
         idxs = flash_knn_triton(x_p, c_p, k, **kwargs)
 
