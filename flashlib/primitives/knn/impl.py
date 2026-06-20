@@ -1,34 +1,21 @@
 """KNN dispatcher + routing rule.
 
-Public entry point: :func:`flash_knn_dispatch` (also reachable via
-:func:`flashlib.primitives.knn.flash_knn`). The hand-tuned routing rule
-lives in :func:`_route`; the cost model in :mod:`cost` shares the same
-rule via :func:`route_op_name`.
+Public entry: :func:`flash_knn_dispatch` (aka
+:func:`flashlib.primitives.knn.flash_knn`). The routing rule is :func:`_route`
+(shared with the cost model via :func:`route_op_name`); CuteDSL advantage
+shapes are layered on top in :func:`_cutedsl_autopick`.
 
-Backends
---------
-* ``backend="triton"``   -- Triton kernels (default). One unified
-  x²-free dispatcher inside :func:`flashlib.primitives.knn.triton.flash_knn_triton`:
+Backends:
 
-      * iterative-insert top-K kernel with ``BN ∈ {8, 16, 32, 64, 128}``;
-        the shape-only heuristic auto-picks the "search" (M-split
-        flash-decode) vs "large_n" (single-pass per CTA) routing by
-        checking ``ctas_no_split`` after BN is chosen. Pattern-A fast
-        paths catch the ``B*N <= 8`` small-Q corners. x²-free score,
-        indices-only output; the gather pass appends true squared L2.
-      * packed-uint64 sort-merge variant kept for the small-Q +
-        medium-K (``B*N <= 8``, ``16 <= K <= 64``) Pattern-A regime.
-
-  Never materialises an N×M cross matrix to HBM and never loads
-  ``x_sq``; both are hard contracts.
-* ``backend="cutedsl"``  -- Hopper FA3-style fully-fused. Opt-in only
-  (first call per shape pays a CuteDSL compile). Falls back to Triton
-  when the shape sits outside the FA3 sweet spot or compile fails.
-* ``backend="torch"``    -- pure-torch reference (CPU OK, slow).
-
-No ``variant`` axis: callers don't pick between build / search /
-small-N / large-N kernels -- the shape-only heuristic inside the
-Triton dispatcher (and the cost-model gate for CuteDSL FA3) does it.
+* ``triton`` (default) -- one x²-free dispatcher; a shape-only heuristic picks
+  the search vs large-N kernel. Never materialises an N×M cross to HBM and
+  never loads ``x_sq`` (both hard contracts).
+* ``cutedsl`` -- fully-fused, DSL-only; the kernel is hardware-routed (Hopper
+  FA3 ``hopper_impl`` / Blackwell ``blackwell_impl``). Routing is strict: the
+  dispatcher picks one backend and runs it with no cross-backend fallback, so
+  an unsupported explicit ``backend="cutedsl"`` raises rather than silently
+  swapping to Triton.
+* ``torch`` -- pure-torch reference (CPU OK, slow).
 """
 from __future__ import annotations
 
@@ -38,7 +25,7 @@ import torch
 
 from flashlib import _hw
 from flashlib.kernels.distance.triton.knn_gather_l2sq import triton_knn_gather_sqdist
-from flashlib.primitives.knn.cutedsl import cutedsl_flash_knn
+from flashlib.primitives.knn.cutedsl import cutedsl_available, cutedsl_flash_knn
 from flashlib.primitives.knn.torch_fallback import knn_torch_naive
 from flashlib.primitives.knn.triton.dispatch import flash_knn_triton
 
@@ -55,19 +42,19 @@ def _route(
     backend: Optional[str] = None,
     hw: Optional[_hw.HwProps] = None,
 ) -> Backend:
-    """Pick a backend for KNN given workload + hardware.
+    """Pick the *baseline* backend: ``"triton"`` on CUDA, else ``"torch"``.
 
-    Default rule:
-      * CUDA available -> ``"triton"`` (the fused kernel auto-picks
-        small-N vs large-N inside the dispatcher).
-      * else            -> ``"torch"``.
-
-    CuteDSL FA3 is never auto-routed; it is only reachable via the
-    explicit ``backend="cutedsl"`` override -- the multi-minute first
-    call autotune (and the lighter ~5-8 s heuristic compile) makes
-    silent substitution surprising.
+    CuteDSL advantage shapes are layered on top in :func:`flash_knn_dispatch`
+    via :func:`_cutedsl_autopick`, so the cost model (which only sees
+    ``_route``) still treats Triton as the default. An explicit ``backend=``
+    overrides everything.
     """
     if backend is not None:
+        if backend not in _VALID_BACKENDS:
+            raise ValueError(
+                f"backend must be one of {_VALID_BACKENDS} or None, "
+                f"got {backend!r}"
+            )
         return backend
     hw = hw or _hw.current()
     if not hw.is_cuda:
@@ -75,11 +62,102 @@ def _route(
     return "triton"
 
 
+# Backends are DSL-only: the hardware (Hopper vs Blackwell) is NOT a
+# backend -- the router picks the matching CuteDSL kernel by hardware
+# inside ``_cutedsl_knn``.
+_VALID_BACKENDS = ("triton", "cutedsl", "torch")
+
 _OP_NAME = {
     "triton":  "knn_triton",
     "cutedsl": "knn_cutedsl_fa3",
     "torch":   "knn_torch",
 }
+
+# Small-Q threshold below which Triton's tl.dot (min M=16) cannot run on
+# sm_100 -- the CuteDSL backend (Blackwell kernel) is auto-routed there.
+_CUTEDSL_SMALLQ = 16
+
+# Largest k for which the Blackwell build is auto-routed. It wins for k<=20 on
+# B200; its per-thread top-K is O(k^2) and crosses over ~k=22-24, above which
+# the Triton build (MMA-bound, ~flat in k) already matches cake. (Measured.)
+_CUTEDSL_BUILD_KMAX = 20
+
+# Hopper FA3 *build* auto-route band (measured H100, bf16; see
+# benchmarks/results/micro_knn_maxtree_topk.md). The fully-fused TMA+WGMMA build
+# beats Triton 1.4-2.4x for D<=128, N>=50k, k in [4,~22]; Triton catches up at
+# k>=24, so cap k<=20 for margin. Search stays on Triton (wins small/mid-Q and
+# tiles every Q on sm_90).
+_HOPPER_BUILD_KMAX = 20
+_HOPPER_BUILD_NMIN = 50_000
+_HOPPER_BUILD_DMAX = 128
+
+
+def _cutedsl_autopick(x: torch.Tensor, c: torch.Tensor, k: int,
+                      hw: _hw.HwProps) -> bool:
+    """Whether to transparently upgrade Triton->CuteDSL (kernel hardware-routed
+    in :func:`_cutedsl_knn`). Single source of truth for the auto path: routing
+    is strict (no fallback), so this returns ``True`` only where CuteDSL is
+    known to run and win, or where Triton physically can't run. bf16, B==1.
+
+    Blackwell (sm_100), D=128:
+      * build, k<=``_CUTEDSL_BUILD_KMAX``: tcgen05 split-K build beats Triton
+        2-3x at large N. Higher k stays on Triton (top-K O(k^2) crosses over;
+        Triton is MMA-bound, ~flat in k).
+      * search, Q<``_CUTEDSL_SMALLQ``: Triton's ``tl.dot`` needs M>=16 and
+        can't run; the Blackwell search kernel restores it and wins.
+
+    Hopper (sm_90): only the large-N build band (D<=``_HOPPER_BUILD_DMAX``,
+    N>=``_HOPPER_BUILD_NMIN``, k<=``_HOPPER_BUILD_KMAX``) is a win; search
+    stays on Triton (wins small/mid-Q and tiles every Q on sm_90).
+    """
+    if not hw.is_cuda:
+        return False
+    B, N, Dd = x.shape
+    M = c.shape[1]
+    if B != 1 or k > 64:
+        return False
+    if x.dtype != torch.bfloat16 or c.dtype != torch.bfloat16:
+        return False
+    is_build = (x.data_ptr() == c.data_ptr() and N == M)
+
+    if hw.is_blackwell:
+        if Dd != 128:
+            return False
+        try:
+            from flashlib.primitives.knn.cutedsl.blackwell_impl import (
+                blackwell_supported)
+        except Exception:  # noqa: BLE001
+            return False
+        if is_build:
+            if k > _CUTEDSL_BUILD_KMAX:
+                return False
+            return blackwell_supported(x, c, k)
+        # search: only where Triton's MMA-batched path can't run (small Q).
+        if N >= _CUTEDSL_SMALLQ:
+            return False
+        return blackwell_supported(x, c, k)
+
+    if hw.is_hopper:
+        if not is_build:
+            return False
+        if Dd % 16 != 0 or Dd > _HOPPER_BUILD_DMAX:
+            return False
+        if N < _HOPPER_BUILD_NMIN or k > _HOPPER_BUILD_KMAX:
+            return False
+        return cutedsl_available()
+
+    return False
+
+
+def _cutedsl_knn(x: torch.Tensor, c: torch.Tensor, k: int,
+                 hw: _hw.HwProps, **kwargs) -> torch.Tensor:
+    """Run the CuteDSL backend, hardware-routing the kernel: Blackwell (sm_100)
+    -> ``blackwell_impl``; Hopper (sm_90) -> FA3 ``hopper_impl``."""
+    if hw.is_blackwell:
+        from flashlib.primitives.knn.cutedsl.blackwell_impl import (
+            blackwell_flash_knn)
+        return blackwell_flash_knn(x, c, k)
+    return cutedsl_flash_knn(x, c, k, **kwargs)
 
 
 def route_op_name(*, B: int, N: int, M: int, D: int, k: int,
@@ -97,12 +175,8 @@ _KNN_MIN_D = 16  # Triton tl.dot requires K >= 16; sub-16 D inputs are zero-padd
 
 
 def _prepare_inputs(x: torch.Tensor, c: torch.Tensor):
-    """Pad sub-16 D with zeros (zeros contribute 0 to squared L2).
-
-    Padding never affects results -- the extra zero columns produce a
-    zero difference for every (x, c) pair, so both the fused score and
-    the gather-recomputed distance stay correct.
-    """
+    """Pad sub-16 D with zeros: Triton's tl.dot needs K>=16, and zero columns
+    add 0 to squared L2 so results are unchanged."""
     *_, D = x.shape
     if D < _KNN_MIN_D:
         x_pad = torch.zeros((*x.shape[:-1], _KNN_MIN_D),
@@ -185,8 +259,14 @@ def flash_knn_dispatch(
 
     x_p, c_p = _prepare_inputs(x, c)
 
-    if chosen == "cutedsl":
-        idxs = cutedsl_flash_knn(x_p, c_p, k, **kwargs)
+    # Strict routing: pick one backend and run it -- no cross-backend fallback.
+    # For auto (backend=None), _cutedsl_autopick decides Triton vs CuteDSL.
+    hw = _hw.current()
+    use_cutedsl = (chosen == "cutedsl")
+    if backend is None and chosen == "triton":
+        use_cutedsl = _cutedsl_autopick(x_p, c_p, k, hw)
+    if use_cutedsl:
+        idxs = _cutedsl_knn(x_p, c_p, k, hw, **kwargs)
     else:
         idxs = flash_knn_triton(x_p, c_p, k, **kwargs)
 

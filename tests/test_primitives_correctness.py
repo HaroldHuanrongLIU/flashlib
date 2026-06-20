@@ -532,3 +532,73 @@ def test_dbscan_recovers_blobs():
     n_noise = int((labels == -1).sum().item())
     assert n_clusters == 3
     assert n_noise < 50
+
+
+# ---------------------------------------------------------------------------
+# Hopper fused-KNN "maxtree" top-K parity (Blackwell BUILD design port)
+# ---------------------------------------------------------------------------
+
+def _run_fused_strategy(x2d, c2d, c_sq, K, BM, BN, strat, *, use_ws,
+                        use_ws3=False, use_ws4=False, dist_stage=1):
+    """Compile + run one HopperFlashKnnFused top-K strategy; return (N,K)
+    int32 neighbour indices."""
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+    from flashlib.primitives.knn.cutedsl.hopper_impl import HopperFlashKnnFused
+
+    N = x2d.shape[0]
+    out_i = torch.empty((N, K), device=x2d.device, dtype=torch.int32)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    kern = HopperFlashKnnFused(
+        acc_dtype=cutlass.Float32, m_block_size=BM, n_block_size=BN,
+        k_pad=K, use_ws=use_ws, topk_strategy=strat,
+        use_ws3=use_ws3, use_ws4=use_ws4, dist_stage=dist_stage,
+    )
+    comp = cute.compile(kern, from_dlpack(x2d), from_dlpack(c2d),
+                        from_dlpack(c_sq), from_dlpack(out_i), stream)
+    comp(from_dlpack(x2d), from_dlpack(c2d), from_dlpack(c_sq),
+         from_dlpack(out_i), stream)
+    torch.cuda.synchronize()
+    return out_i
+
+
+def _rows_set_equal(a, b):
+    a, b = a.cpu(), b.cpu()
+    return all(
+        set(a[i].tolist()) == set(b[i].tolist()) for i in range(a.shape[0])
+    )
+
+
+@pytest.mark.skipif(not _hopper_cutedsl(), reason="Hopper + CUTLASS DSL required")
+@pytest.mark.parametrize("K", [4, 12, 16])
+def test_maxtree_topk_parity(K):
+    """The ported maxtree top-K must return the SAME top-K neighbour set as the
+    strategy it replaces (both are exact; only equal-distance tie order may
+    differ, which set-equality ignores).
+
+      * register  : ``maxtree``      vs ``perthread``      (non-WS)
+      * 1-per-row : ``smem_maxtree`` vs ``smem_perthread`` (WS3)
+
+    K spans both worst-of-K branches of ``_worst_row``: K=4 the balanced
+    max-tree, K=12/16 the streaming running-max (the Blackwell BUILD learning,
+    used at K>=11 to dodge the max-tree's MLIR register spill).
+    """
+    torch.manual_seed(0)
+    N, M, D = 512, 4096, 64
+    x = torch.randn(N, D, device="cuda", dtype=torch.bfloat16)
+    c = torch.randn(M, D, device="cuda", dtype=torch.bfloat16)
+    c_sq = (c.float() ** 2).sum(1).contiguous()
+
+    old = _run_fused_strategy(x, c, c_sq, K, 128, 128, "perthread",
+                              use_ws=False)
+    new = _run_fused_strategy(x, c, c_sq, K, 128, 128, "maxtree", use_ws=False)
+    assert _rows_set_equal(old, new), "maxtree top-K set != perthread"
+
+    BM, BN = (64, 128) if K <= 16 else (128, 64)
+    old_s = _run_fused_strategy(x, c, c_sq, K, BM, BN, "smem_perthread",
+                                use_ws=True, use_ws3=True, dist_stage=2)
+    new_s = _run_fused_strategy(x, c, c_sq, K, BM, BN, "smem_maxtree",
+                                use_ws=True, use_ws3=True, dist_stage=2)
+    assert _rows_set_equal(old_s, new_s), "smem_maxtree top-K set != smem_perthread"

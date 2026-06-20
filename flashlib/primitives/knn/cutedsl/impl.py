@@ -24,24 +24,87 @@ fused pass. This matches the contract of the new
 Public API
 ----------
 ``cutedsl_flash_knn(x, c, k)``
-    FA3-style fully-fused KNN (Hopper-only). Falls back to the Triton
-    :func:`flashlib.primitives.knn.triton.flash_knn_triton` path for
-    any shape outside the FA3 sweet spot (B != 1, fp32 input,
-    ``D % 16 != 0``, ``D > 512``, ``k > k_max``, or first-call compile
-    failure). Returns ``(B, N, k) int32`` indices.
+    FA3-style fully-fused KNN (Hopper-only). Pure executor: runs the FA3
+    kernel or raises :class:`CuteDSLUnsupported` for any shape outside the
+    FA3 sweet spot (B != 1, fp32 input, ``D % 16 != 0``, ``D > 512``,
+    ``k > k_max``, or first-call compile failure). It never delegates to
+    Triton -- the dispatcher (:func:`flashlib.primitives.knn.flash_knn`)
+    owns all backend routing and fallback. Returns ``(B, N, k) int32``
+    indices.
 
 ``cutedsl_available()``
     Cheap probe for whether the cutlass-dsl Python bindings imported.
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
 
 from flashlib.linalg.gemm import storage_dtype_for
 from flashlib.primitives.knn.triton._row_norm import _get_or_compute_csq
-from flashlib.primitives.knn.triton.dispatch import flash_knn_triton
+
+# =============================================================================
+# Maxtree top-K toggle (Blackwell BUILD design ported to Hopper)
+# =============================================================================
+#
+# The ``maxtree`` / ``smem_maxtree`` strategies are the register / smem ports of
+# the Blackwell BUILD top-K (unsorted heap + group-min-4 prune + worst-of-K
+# recompute). The worst-of-K recompute is K-adaptive (``_worst_row``): a shallow
+# balanced max-tree for K<=10, a streaming running-max for K>=11. The streaming
+# scan keeps only 2 scalars live instead of all K leaves, so the heap stops
+# spilling at high K -- the learning ported from the Blackwell BUILD kernel,
+# which hit the same MLIR spill and made the same switch. Measured win regions
+# on this H100 (see ``benchmarks/results/micro_knn_maxtree_topk.md``):
+#
+#   * SEARCH (1-thread-per-row ``smem_maxtree``, WS3): wins at K<=16
+#     (1.13-1.36x across M=32k..131k); spills / loses at K>=32.
+#   * BUILD (register ``maxtree``, non-WS): wins at LARGE N across a wide K
+#     band -- D<=128, N>=50k, K in [5,24] at the BM256/BN64 tile (K=5
+#     1.15-1.25x and K in [17,24] 2-4x vs the strategy it replaces; all
+#     exact). The K>10 half of the band is new: the streaming worst-of-K
+#     stops the heap spilling that capped the old max-tree at K<=10, and the
+#     unsorted heap then crushes the sorted ``sortmerge`` that used to own
+#     K>16. K=4 loses (one prune group -> ``perthread``); small N loses
+#     (fixed merge + epilogue-sort dominates the short mainloop). The
+#     ``sortmerge`` bitonic only re-takes the lead at K~28-32, and only at
+#     its own BM128/BN128 tile -> K>=25 hands back to ``sortmerge`` there.
+#
+# The heuristic therefore has THREE modes:
+#
+#   * "auto" (default): adopt each port ONLY in its measured win region
+#     (search K<=16; build D<=128 / N>=50k / K in [5,24]); keep the
+#     existing strategies everywhere else. This is the production default
+#     -- flash_knn transparently "eats" the wins without regressing any
+#     other shape.
+#   * "on":  full swap -- ``maxtree`` (build) + ``smem_maxtree`` (search) for
+#     every shape. The benchmark's NEW column.
+#   * "off": the original strategies everywhere (``smem_perthread`` for
+#     search). The benchmark's OLD baseline column.
+#
+# Drive it via ``FLASHLIB_KNN_MAXTREE`` (``1``/``0``, env, re-read each call)
+# or :func:`set_maxtree_enabled` (overrides env; ``None`` reverts to "auto").
+
+_USE_MAXTREE: Optional[bool] = None  # None -> "auto" (env / default).
+
+
+def set_maxtree_enabled(enabled: Optional[bool]) -> None:
+    """Force the maxtree top-K fully on / off (``None`` reverts to "auto")."""
+    global _USE_MAXTREE
+    _USE_MAXTREE = enabled
+
+
+def _maxtree_mode() -> str:
+    """Return one of ``"on"`` / ``"off"`` / ``"auto"`` (see module note)."""
+    if _USE_MAXTREE is True:
+        return "on"
+    if _USE_MAXTREE is False:
+        return "off"
+    env = os.environ.get("FLASHLIB_KNN_MAXTREE")
+    if env is None:
+        return "auto"
+    return "off" if env.lower() in ("0", "", "false", "no", "off") else "on"
 
 
 # =============================================================================
@@ -132,6 +195,7 @@ def _trim_dlpack_cache(max_entries: int = 64):
 
 
 def _heuristic_fa3_config(N: int, M: int, D: int, K_PAD: int) -> dict:
+    maxtree_mode = _maxtree_mode()  # "on" | "off" | "auto"
     is_build = (N >= 10_000) and (0.5 <= M / N <= 2.0)
     if is_build:
         BM = 256 if N >= 50_000 else 128
@@ -157,21 +221,55 @@ def _heuristic_fa3_config(N: int, M: int, D: int, K_PAD: int) -> dict:
         else:
             strat = "sortmerge"
             BN = 128 if BM == 128 else 64
+        # maxtree carve-out (per-K winner sweep on H100; see the module note
+        # + benchmarks/results/micro_knn_maxtree_topk.md). The unsorted heap
+        # + group-min-4 prune beats every other build top-K for mid/high K at
+        # large N. The worst-of-K recompute is K-adaptive
+        # (``HopperFlashKnnFused._worst_row``): a shallow balanced max-tree
+        # for K<=10, a streaming running-max for K>=11 that keeps only 2
+        # scalars live so the heap stops spilling at high K (the learning
+        # ported from the Blackwell BUILD kernel). Win band: D<=128, N>=50k,
+        # K in [5,24] at the BM256/BN64 tile. K=5 1.15-1.25x vs perthread;
+        # K in [17,24] beats sortmerge 2-4x (the old K>16 fallback); all
+        # exact. K=4 stays ``perthread`` (wins ~1.05-1.08x); from K~28-32 the
+        # sortmerge bitonic finally crosses over (at its BM128/BN128 tile) so
+        # K>=25 hands back to sortmerge.
+        maxtree_build_win = (D <= 128 and N >= 50_000 and 5 <= K_PAD <= 24)
+        if maxtree_mode == "on":
+            strat = "maxtree"
+        elif maxtree_mode == "auto" and maxtree_build_win:
+            strat = "maxtree"
+        # sortmerge's bitonic network is ~1.6x faster at BM128/BN128 than at
+        # the BM256/BN64 perthread/maxtree tile (measured K=20..32, D=64/128,
+        # N>=50k: ~68us vs ~110us; matches the upstream D=256 autotune). Give
+        # it that tile whenever it is the final pick -- the maxtree="off"
+        # baseline, wide-D builds, and the K>24 / K>16-low-N fallbacks.
+        if strat == "sortmerge":
+            BM, BN = 128, 128
         return dict(
             BM=BM, BN=BN,
             use_ws=False, topk_strategy=strat,
             use_ws3=False, use_ws4=False, dist_stage=1,
         )
 
+    # Search shapes: WS3 1-thread-per-row. smem_maxtree keeps the same WS3
+    # pipeline + chunk-min prune, swapping only the inner top-K.
     if K_PAD <= 16:
+        # smem_maxtree wins (or ties) here -> adopt it in "auto" and "on".
+        search_strat = (
+            "smem_perthread" if maxtree_mode == "off" else "smem_maxtree"
+        )
         return dict(
             BM=64, BN=128,
-            use_ws=True, topk_strategy="smem_perthread",
+            use_ws=True, topk_strategy=search_strat,
             use_ws3=True, use_ws4=False, dist_stage=3,
         )
+    # K>16 search: smem_maxtree spills (loses ~0.64x at K=32) -> only when
+    # fully forced on; "auto" keeps the sorted smem_perthread.
+    search_strat = "smem_maxtree" if maxtree_mode == "on" else "smem_perthread"
     return dict(
         BM=128, BN=64,
-        use_ws=True, topk_strategy="smem_perthread",
+        use_ws=True, topk_strategy=search_strat,
         use_ws3=True, use_ws4=False, dist_stage=3,
     )
 
@@ -186,6 +284,25 @@ def _heuristic_fa3_config(N: int, M: int, D: int, K_PAD: int) -> dict:
 _autotune_cache: dict = {}
 _heuristic_cache: dict = {}
 
+# Query-dim padding granularity for the search path. Must be a multiple of
+# every search-tile BM the heuristic / autotune can pick (64 for K<=16, 128
+# otherwise), so that padding N up to this never leaves a partial query tile
+# for the FA3 kernel to read OOB.
+_Q_TILE_PAD = 128
+
+
+class CuteDSLUnsupported(RuntimeError):
+    """The FA3 CuteDSL kNN cannot run/compile a shape (capability gate or a
+    compile failure). ``cutedsl_flash_knn`` raises this instead of silently
+    delegating to Triton -- the *dispatcher* owns all backend routing, so it
+    catches this to fall back to Triton (or surfaces it for an explicit
+    ``backend="cutedsl"``)."""
+
+
+# Cache sentinel: a shape we already proved CuteDSL can't take, so we re-raise
+# immediately instead of re-attempting the (failed) compile every call.
+_CUTEDSL_FAILED = "unsupported"
+
 
 def _autotune_fa3(x2d, c2d, c_sq_1d, out_i, k_pad: int, *, verbose: bool = False):
     """Compile + bench every fitting (BM, BN, use_ws, strategy) FA3 config."""
@@ -194,7 +311,7 @@ def _autotune_fa3(x2d, c2d, c_sq_1d, out_i, k_pad: int, *, verbose: bool = False
     import cutlass.cute as cute_mod
     from cutlass.cute.runtime import from_dlpack as _from_dlpack
 
-    from flashlib.primitives.knn.cutedsl.fused_kernel import HopperFlashKnnFused
+    from flashlib.primitives.knn.cutedsl.hopper_impl import HopperFlashKnnFused
 
     N, D = x2d.shape
     M = c2d.shape[0]
@@ -207,9 +324,9 @@ def _autotune_fa3(x2d, c2d, c_sq_1d, out_i, k_pad: int, *, verbose: bool = False
         return (bm * D * bytes_per + bn * D * bytes_per + 1024) <= smem_capacity
 
     if k_pad <= 3:
-        strategies = ("insert", "perthread", "sortmerge")
+        strategies = ("insert", "perthread", "maxtree", "sortmerge")
     else:
-        strategies = ("perthread", "sortmerge")
+        strategies = ("perthread", "maxtree", "sortmerge")
 
     bms = (64, 128, 256)
     bns = (64, 128, 256)
@@ -234,15 +351,17 @@ def _autotune_fa3(x2d, c2d, c_sq_1d, out_i, k_pad: int, *, verbose: bool = False
     for bm, bn in ws3_tiles:
         if _fits(bm, bn):
             for stage in (3, 2):
-                candidates.append(
-                    (bm, bn, True, "smem_perthread", True, False, stage)
-                )
+                for smem_strat in ("smem_perthread", "smem_maxtree"):
+                    candidates.append(
+                        (bm, bn, True, smem_strat, True, False, stage)
+                    )
     ws4_tiles = [(64, 64), (64, 128), (128, 64)]
     for bm, bn in ws4_tiles:
         if _fits(bm, bn) and bm * bn <= 128 * 64:
-            candidates.append(
-                (bm, bn, True, "smem_perthread", True, True, 2)
-            )
+            for smem_strat in ("smem_perthread", "smem_maxtree"):
+                candidates.append(
+                    (bm, bn, True, smem_strat, True, True, 2)
+                )
 
     stream = cuda_drv.CUstream(0)
     best = None
@@ -333,12 +452,18 @@ def cutedsl_flash_knn(
 ) -> torch.Tensor:
     """Hopper FA3 fully-fused kNN. Returns ``(B, N, k) int32`` indices.
 
+    Pure executor: it runs the FA3 kernel for this shape or raises
+    :class:`CuteDSLUnsupported`. It never delegates to Triton -- the
+    dispatcher (:func:`flashlib.primitives.knn.flash_knn_dispatch`) owns all
+    Triton<->CuteDSL routing and fallback. Partial / small query tiles are
+    padded up to a full tile internally so any Q is valid.
+
     Args:
         x: (B, N, D) -- bf16 / fp16 native. fp32 input + ``tol`` selecting
-            bf16/fp16 storage is cast once; otherwise fp32 falls back to
-            Triton (FA3 path requires 16-bit storage).
+            bf16/fp16 storage is cast once; otherwise an fp32 input raises
+            (FA3 path requires 16-bit storage).
         c: (B, M, D) -- same dtype as x, D contiguous.
-        k: number of neighbours. ``k > k_max`` falls back to Triton.
+        k: number of neighbours. ``k > k_max`` raises.
         tol: residual tolerance.
             * ``None`` (default) -- preserve input dtype (EXACT path).
             * Otherwise the standard
@@ -346,18 +471,22 @@ def cutedsl_flash_knn(
               applied to ``x``/``c`` once internally.
         autotune: if False (default), pick a single FA3 config from
             :func:`_heuristic_fa3_config` -- first call pays one
-            CuteDSL compile (~5-8 s) instead of ~5-10 min for the full
-            sweep. ``True`` runs the brute-force search and caches the
-            winner (also racing against Triton to handle FA3-loses-to-
-            tl.sort shapes).
+            CuteDSL compile (~3-8 s) instead of ~5-10 min for the full
+            sweep. ``True`` runs the brute-force search over FA3 configs and
+            caches the fastest one (whether it beats Triton is the
+            dispatcher's call, not this function's).
         autotune_verbose: print per-candidate timings during autotune.
-        k_max: gate threshold; ``k > k_max`` routes to Triton.
+        k_max: gate threshold; ``k > k_max`` raises.
 
     Returns:
         ``(B, N, k) int32`` indices, sorted ascending by squared L2
         (ties broken by index). True distances per neighbour are
         recovered by
         :func:`flashlib.kernels.distance.triton_knn_gather_sqdist`.
+
+    Raises:
+        CuteDSLUnsupported: dtype/shape/k outside the FA3 path, CuteDSL
+            unavailable, or the kernel failed to compile for this shape.
     """
     assert x.is_cuda and c.is_cuda
     target_dtype = storage_dtype_for(tol)
@@ -369,6 +498,23 @@ def cutedsl_flash_knn(
     assert c.shape == (B, M, D)
     assert 1 <= k <= M
 
+    # The FA3 kernel's query loop processes full BM-row tiles; a query count
+    # that is not a multiple of the tile (especially small-Q search, N < BM)
+    # would read past the x buffer -> illegal instruction. (Triton's tl.dot
+    # has the mirror problem: it cannot tile Q < 16 and asserts on sm_100.)
+    # Pad the query dim up to a full tile, run, then slice back. For Q <= BM
+    # this stays a single tile, so it adds no extra DB passes (~free); only
+    # the search path needs it (build N is large and tile-aligned).
+    _is_build = (N >= 10_000) and (0.5 <= M / N <= 2.0)
+    if not _is_build and (N % _Q_TILE_PAD != 0):
+        N_pad = ((N + _Q_TILE_PAD - 1) // _Q_TILE_PAD) * _Q_TILE_PAD
+        x_pad = x.new_zeros((B, N_pad, D))
+        x_pad[:, :N] = x
+        return cutedsl_flash_knn(
+            x_pad, c, k, tol=tol, autotune=autotune,
+            autotune_verbose=autotune_verbose, k_max=k_max,
+        )[:, :N]
+
     if (
         not _try_init_cutedsl()
         or B != 1
@@ -378,30 +524,10 @@ def cutedsl_flash_knn(
         or D > 512
         or k > k_max
     ):
-        return flash_knn_triton(x, c, k)
-
-    # Shape-based fast-path opt-out (heuristic mode only): when Triton
-    # clearly wins, don't pay the FA3 compile + dispatch tax. Autotune
-    # mode races against Triton dynamically and caches the winner.
-    #
-    # Empirical regime (H200 / bf16) where Triton beats FA3:
-    #   * N < 8192 -- FA3 warp-per-row epilogue under-fed.
-    #   * D < 192 AND N < 50_000 -- narrow-D mid-N shapes where Triton
-    #     keeps the cross on-chip cheaper than FA3's TMA + WGMMA stack.
-    #     At very-large N (build shapes like (1, 100K, 100K, 64, *))
-    #     FA3 non-WS BM=256 still beats Triton, so the carve-out is
-    #     bounded.
-    #   * M < 50K AND k < 32 AND not_build -- small DB + small K = FA3
-    #     overhead dominates; Triton wins by 1.3-1.5x. The "not_build"
-    #     carve-out lets large-N square shapes like (1, 10K, 10K, 256, *)
-    #     through to FA3 where autotune finds wins.
-    is_build = (N >= 10_000) and (0.5 <= M / N <= 2.0)
-    if not autotune and (
-        N < 8192
-        or (D < 192 and N < 50_000)
-        or (M < 50_000 and k < 32 and not is_build)
-    ):
-        return flash_knn_triton(x, c, k)
+        raise CuteDSLUnsupported(
+            f"FA3 path cannot run this shape (B={B}, D={D}, k={k}, "
+            f"k_max={k_max}, dtype={x.dtype}, cutedsl={_try_init_cutedsl()})"
+        )
 
     c_sq = _get_or_compute_csq(c).view(M).contiguous()
 
@@ -417,12 +543,15 @@ def cutedsl_flash_knn(
 
     if not autotune:
         cached_h = _heuristic_cache.get(ac_key)
+        if cached_h == _CUTEDSL_FAILED:
+            raise CuteDSLUnsupported(
+                f"FA3 heuristic compile previously failed for {ac_key}")
         if cached_h is None:
             import cuda.bindings.driver as cuda_drv
             import cutlass
             import cutlass.cute as cute_mod
             from cutlass.cute.runtime import from_dlpack as _from_dlpack
-            from flashlib.primitives.knn.cutedsl.fused_kernel import (
+            from flashlib.primitives.knn.cutedsl.hopper_impl import (
                 HopperFlashKnnFused,
             )
 
@@ -443,26 +572,25 @@ def cutedsl_flash_knn(
                     _from_dlpack(c_sq), _from_dlpack(out_i),
                     stream,
                 )
-                cached_h = (compiled, stream)
-                _heuristic_cache[ac_key] = cached_h
-            except Exception:
-                _heuristic_cache[ac_key] = "triton"
-                return flash_knn_triton(x, c, k)
-        elif cached_h == "triton":
-            return flash_knn_triton(x, c, k)
+            except Exception as exc:
+                _heuristic_cache[ac_key] = _CUTEDSL_FAILED
+                raise CuteDSLUnsupported(
+                    f"FA3 heuristic compile failed for {ac_key}") from exc
+            cached_h = (compiled, stream)
+            _heuristic_cache[ac_key] = cached_h
 
         compiled, stream = cached_h
-        try:
-            compiled(
-                _cached_from_dlpack(x2d), _cached_from_dlpack(c2d),
-                _cached_from_dlpack(c_sq), _cached_from_dlpack(out_i),
-                stream,
-            )
-        except Exception:
-            return flash_knn_triton(x, c, k)
+        compiled(
+            _cached_from_dlpack(x2d), _cached_from_dlpack(c2d),
+            _cached_from_dlpack(c_sq), _cached_from_dlpack(out_i),
+            stream,
+        )
         return out_i.view(B, N, K_PAD)
 
     cached = _autotune_cache.get(ac_key)
+    if cached == _CUTEDSL_FAILED:
+        raise CuteDSLUnsupported(
+            f"FA3 autotune previously failed for {ac_key}")
     if cached is None:
         try:
             (
@@ -472,35 +600,13 @@ def cutedsl_flash_knn(
                 x2d, c2d, c_sq, out_i, K_PAD,
                 verbose=autotune_verbose,
             )
-        except Exception:
-            _autotune_cache[ac_key] = "triton"
-            return flash_knn_triton(x, c, k)
-
-        # Race against the Triton flash_knn_triton path so the wrapper
-        # benefits from whichever Triton kernel (M-split or single-pass)
-        # is best for this shape.
-        try:
-            for _ in range(3):
-                flash_knn_triton(x, c, k)
-            torch.cuda.synchronize()
-            s = torch.cuda.Event(enable_timing=True)
-            e = torch.cuda.Event(enable_timing=True)
-            s.record()
-            for _ in range(8):
-                flash_knn_triton(x, c, k)
-            e.record()
-            torch.cuda.synchronize()
-            tri_us = s.elapsed_time(e) / 8 * 1000
-        except Exception:
-            tri_us = float("inf")
-        if tri_us < _t_us:
-            _autotune_cache[ac_key] = "triton"
-            if autotune_verbose:
-                print(
-                    f"  fa3 vs triton: triton wins "
-                    f"({tri_us:.0f} us < {_t_us:.0f} us) -- caching fallback"
-                )
-            return flash_knn_triton(x, c, k)
+        except Exception as exc:
+            _autotune_cache[ac_key] = _CUTEDSL_FAILED
+            raise CuteDSLUnsupported(
+                f"FA3 autotune failed for {ac_key}") from exc
+        # Autotune finds the fastest FA3 config and caches it. Whether FA3 is
+        # worth it vs Triton for this shape is the dispatcher's routing call
+        # (``_cutedsl_autopick``), not this executor's.
         _autotune_cache[ac_key] = (compiled, stream)
         if autotune_verbose:
             tag = (
@@ -510,20 +616,14 @@ def cutedsl_flash_knn(
             stg = f" stg={dist_stage}" if (use_ws3 or use_ws4) else ""
             print(
                 f"  fa3 winner: BM={BM} BN={BN} {tag}{stg} "
-                f"strat={strat} ({_t_us:.0f} us, triton {tri_us:.0f} us)"
+                f"strat={strat} ({_t_us:.0f} us)"
             )
-    elif cached == "triton":
-        return flash_knn_triton(x, c, k)
     else:
         compiled, stream = cached
 
-    try:
-        compiled(
-            _cached_from_dlpack(x2d), _cached_from_dlpack(c2d),
-            _cached_from_dlpack(c_sq), _cached_from_dlpack(out_i),
-            stream,
-        )
-    except Exception:
-        return flash_knn_triton(x, c, k)
-
+    compiled(
+        _cached_from_dlpack(x2d), _cached_from_dlpack(c2d),
+        _cached_from_dlpack(c_sq), _cached_from_dlpack(out_i),
+        stream,
+    )
     return out_i.view(B, N, K_PAD)
