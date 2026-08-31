@@ -1785,6 +1785,7 @@ if _BW_AVAILABLE:
                     accA_pipe.consumer_wait(accA_cons)
                     cute.copy(tiled_copy_t2r,
                               tTR_tAccA[(None, None, None, 0, 0)], tTR_rAcc)
+                    cute.arch.fence_view_async_tmem_load()
                     accA_pipe.consumer_release(accA_cons)
                     accA_cons.advance()
                     epi_bar.arrive_and_wait()
@@ -1799,6 +1800,7 @@ if _BW_AVAILABLE:
                     accB_pipe.consumer_wait(accB_cons)
                     cute.copy(tiled_copy_t2r,
                               tTR_tAccB[(None, None, None, 0, 0)], tTR_rAcc)
+                    cute.arch.fence_view_async_tmem_load()
                     accB_pipe.consumer_release(accB_cons)
                     accB_cons.advance()
                     epi_bar.arrive_and_wait()
@@ -1812,6 +1814,295 @@ if _BW_AVAILABLE:
 
             cute.arch.sync_threads()
             tmem.free(pool.base_ptr)
+
+    class BlackwellFlashKmeansAssignWSNormBroadcast(
+            BlackwellFlashKmeansAssignWS):
+        """WS kernel with register-loaded, warp-broadcast centroid norms.
+
+        This class inherits only the host-side setup. Its kernel body is
+        independent of the baseline WS implementation so the baseline binary
+        contains no norm-broadcast flags, storage, or control flow.
+        """
+
+        @cute.kernel
+        def kernel(self, tiled_mma, tma_atom_a, mX, tma_atom_b, mC,
+                   mCsq, mOut, cluster_layout_vmnk,
+                   a_smem_layout, b_smem_layout):
+            num_x_stage = self.num_x_stage
+            num_c_stage = self.num_c_stage
+            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            tidx, _, _ = cute.arch.thread_idx()
+            bidx, _, _ = cute.arch.block_idx()
+
+            # Roles (cake's 3-way split): warp 5 = TMA load, warp 4 = MMA,
+            # warps 0-3 = epilogue. The epilogue stays on the natural warps 0-3
+            # so each thread's tcgen05 tmem load reads its own row (TMEM
+            # partitions are bound to the physical warp).
+            is_load = warp_idx == 5
+            is_mma = warp_idx == 4
+            if is_load:
+                cpasync.prefetch_descriptor(tma_atom_a)
+                cpasync.prefetch_descriptor(tma_atom_b)
+
+            block_n = self.block_n
+
+            @cute.struct
+            class SharedStorage:
+                x_full: cute.struct.MemRange[cutlass.Int64, num_x_stage * 2]
+                c_full: cute.struct.MemRange[cutlass.Int64, num_c_stage * 2]
+                accA_full: cute.struct.MemRange[cutlass.Int64, 2]
+                accB_full: cute.struct.MemRange[cutlass.Int64, 2]
+                tmem_dealloc: cutlass.Int64
+                tmem_holding: cutlass.Int32
+
+            smem = utils.SmemAllocator()
+            storage = smem.allocate(SharedStorage)
+
+            x_pipeline = pipeline.PipelineTmaUmma.create(
+                barrier_storage=storage.x_full.data_ptr(),
+                num_stages=num_x_stage,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, 1),
+                tx_count=self.num_tma_x_bytes,
+                cta_layout_vmnk=None, defer_sync=True)
+            x_prod = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, num_x_stage)
+            x_cons = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, num_x_stage)
+
+            c_pipeline = pipeline.PipelineTmaUmma.create(
+                barrier_storage=storage.c_full.data_ptr(),
+                num_stages=num_c_stage,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, 1),
+                tx_count=self.num_tma_c_bytes,
+                cta_layout_vmnk=None, defer_sync=True)
+            c_prod = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, num_c_stage)
+            c_cons = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, num_c_stage)
+
+            def _make_acc_pipe(buf):
+                return pipeline.PipelineUmmaAsync.create(
+                    barrier_storage=buf, num_stages=1,
+                    producer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread),
+                    consumer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread, self.epi_threads),
+                    cta_layout_vmnk=None, defer_sync=True)
+
+            accA_pipe = _make_acc_pipe(storage.accA_full.data_ptr())
+            accB_pipe = _make_acc_pipe(storage.accB_full.data_ptr())
+            accA_prod = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 1)
+            accA_cons = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 1)
+            accB_prod = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 1)
+            accB_cons = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 1)
+
+            tmem_alloc_bar = pipeline.NamedBarrier(
+                barrier_id=1, num_threads=self.threads_per_cta)
+            tmem = utils.TmemAllocator(
+                storage.tmem_holding, barrier_for_retrieve=tmem_alloc_bar,
+                is_two_cta=False,
+                two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc)
+
+            pipeline_init_arrive(is_relaxed=True)
+
+            sX = smem.allocate_tensor(self.x_dtype, a_smem_layout.outer, 128,
+                                      swizzle=a_smem_layout.inner)
+            sC = smem.allocate_tensor(self.c_dtype_in, b_smem_layout.outer, 128,
+                                      swizzle=b_smem_layout.inner)
+            gX = cute.local_tile(mX, cute.slice_(self.mma_tiler, (None, 0, None)),
+                                 (None, None, None))
+            gC = cute.local_tile(mC, cute.slice_(self.mma_tiler, (0, None, None)),
+                                 (None, None, None))
+            n_db_tiles = cute.size(gC, mode=[2])
+            k_tile_cnt = cute.size(gX, mode=[3])
+
+            thr_mma = tiled_mma.get_slice(0)
+            tCgX = thr_mma.partition_A(gX)
+            tCgC = thr_mma.partition_B(gC)
+            aL = cute.make_layout(
+                cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
+            tXsX, tXgX = cpasync.tma_partition(
+                tma_atom_a, 0, aL, cute.group_modes(sX, 0, 3),
+                cute.group_modes(tCgX, 0, 3))
+            bL = cute.make_layout(
+                cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
+            tCsC, tCgC2 = cpasync.tma_partition(
+                tma_atom_b, 0, bL, cute.group_modes(sC, 0, 3),
+                cute.group_modes(tCgC, 0, 3))
+
+            tCrX = tiled_mma.make_fragment_A(sX)
+            tCrC = tiled_mma.make_fragment_B(sC)
+            acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+            tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+
+            pipeline_init_wait()
+            pool = tmem.reserve(self.num_tmem_alloc_cols)
+            tCtAccA = pool.allocate_tensor(tCtAcc_fake.layout, self.acc_dtype)
+            tCtAccB = pool.allocate_tensor(tCtAcc_fake.layout, self.acc_dtype)
+
+            tXgX = tXgX[(None, bidx, None, 0)]
+
+            copy_atom_t2r = sm100_utils.get_tmem_load_op(
+                self.cta_tile_shape_mnk, self.c_layout, cutlass.Float32,
+                self.acc_dtype, self.epi_tile, False)
+            tAcc_epiA = cute.flat_divide(tCtAccA[((None, None), 0, 0)],
+                                         self.epi_tile)
+            tAcc_epiB = cute.flat_divide(tCtAccB[((None, None), 0, 0)],
+                                         self.epi_tile)
+            tiled_copy_t2r = tcgen05.make_tmem_copy(
+                copy_atom_t2r, tAcc_epiA[(None, None, 0, 0)])
+            # epilogue warps 0-3: thread tidx owns row tidx (natural mapping)
+            thr_t2r = tiled_copy_t2r.get_slice(tidx)
+            tTR_tAccA = thr_t2r.partition_S(tAcc_epiA)
+            tTR_tAccB = thr_t2r.partition_S(tAcc_epiB)
+            tTR_rAcc = cute.make_rmem_tensor(
+                cute.make_layout(((block_n, 1), 1, 1)), self.acc_dtype)
+            rNorm = cute.make_rmem_tensor(
+                cute.make_layout((block_n // 32,)), cutlass.Float32)
+
+            tmem.relinquish_alloc_permit()
+
+            best_s = cutlass.Float32(INF)
+            best_i = cutlass.Int32(-1)
+            nkb = cute.size(tCrX, mode=[2])
+            n_pairs = n_db_tiles // 2
+
+            if is_load:
+                # ---- LOAD warp: TMA the point tile once (resident), then
+                # stream every centroid tile (runs ahead of the MMA warp).
+                for kk in cutlass.range(k_tile_cnt):
+                    x_pipeline.producer_acquire(x_prod)
+                    bar = x_pipeline.producer_get_barrier(x_prod)
+                    cute.copy(tma_atom_a, tXgX[(None, kk)],
+                              tXsX[(None, x_prod.index)], tma_bar_ptr=bar,
+                              mcast_mask=None)
+                    x_prod.advance()
+                for dd in cutlass.range(n_db_tiles):
+                    for kk in cutlass.range(k_tile_cnt):
+                        c_pipeline.producer_acquire(c_prod)
+                        bar = c_pipeline.producer_get_barrier(c_prod)
+                        cute.copy(tma_atom_b, tCgC2[(None, dd, kk, 0)],
+                                  tCsC[(None, c_prod.index)], tma_bar_ptr=bar,
+                                  mcast_mask=None)
+                        c_prod.advance()
+                c_pipeline.producer_tail(c_prod)
+                x_pipeline.producer_tail(x_prod)
+            elif is_mma:
+                # ---- MMA warp: free the resident-X barriers, then MMA each
+                # centroid tile into the two-accumulator ring (A/B).
+                for kk in cutlass.range(k_tile_cnt):
+                    x_pipeline.consumer_wait(x_cons)
+                    x_pipeline.consumer_release(x_cons)
+                    x_cons.advance()
+                for dd2 in cutlass.range(n_pairs):
+                    accA_pipe.producer_acquire(accA_prod)
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                    for kk in cutlass.range(k_tile_cnt):
+                        c_pipeline.consumer_wait(c_cons)
+                        for kb in cutlass.range(nkb, unroll_full=True):
+                            cute.gemm(tiled_mma, tCtAccA,
+                                      tCrX[(None, None, kb, kk)],
+                                      tCrC[(None, None, kb, c_cons.index)],
+                                      tCtAccA)
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        c_pipeline.consumer_release(c_cons)
+                        c_cons.advance()
+                    accA_pipe.producer_commit(accA_prod)
+                    accA_prod.advance()
+
+                    accB_pipe.producer_acquire(accB_prod)
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                    for kk in cutlass.range(k_tile_cnt):
+                        c_pipeline.consumer_wait(c_cons)
+                        for kb in cutlass.range(nkb, unroll_full=True):
+                            cute.gemm(tiled_mma, tCtAccB,
+                                      tCrX[(None, None, kb, kk)],
+                                      tCrC[(None, None, kb, c_cons.index)],
+                                      tCtAccB)
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        c_pipeline.consumer_release(c_cons)
+                        c_cons.advance()
+                    accB_pipe.producer_commit(accB_prod)
+                    accB_prod.advance()
+            else:
+                # ---- consumer: warp lanes load norms into registers and
+                # broadcast them with SHFL; no shared norm buffer or barrier.
+                for dd2 in cutlass.range(n_pairs):
+                    baseA = (2 * dd2) * block_n
+                    for q in cutlass.range_constexpr(block_n // 32):
+                        rNorm[q] = 0.5 * mCsq[
+                            baseA + q * 32 + tidx % 32]
+                    accA_pipe.consumer_wait(accA_cons)
+                    cute.copy(tiled_copy_t2r,
+                              tTR_tAccA[(None, None, None, 0, 0)], tTR_rAcc)
+                    cute.arch.fence_view_async_tmem_load()
+                    accA_pipe.consumer_release(accA_cons)
+                    accA_cons.advance()
+                    fragA = tTR_rAcc.load()
+                    for n in cutlass.range_constexpr(block_n):
+                        norm = cute.arch.shuffle_sync(
+                            rNorm[n // 32], n % 32)
+                        score = norm - fragA[n]
+                        take = score < best_s
+                        best_s = cutlass.select_(take, score, best_s)
+                        best_i = cutlass.select_(
+                            take, cutlass.Int32(baseA + n), best_i)
+
+                    baseB = (2 * dd2 + 1) * block_n
+                    for q in cutlass.range_constexpr(block_n // 32):
+                        rNorm[q] = 0.5 * mCsq[
+                            baseB + q * 32 + tidx % 32]
+                    accB_pipe.consumer_wait(accB_cons)
+                    cute.copy(tiled_copy_t2r,
+                              tTR_tAccB[(None, None, None, 0, 0)], tTR_rAcc)
+                    cute.arch.fence_view_async_tmem_load()
+                    accB_pipe.consumer_release(accB_cons)
+                    accB_cons.advance()
+                    fragB = tTR_rAcc.load()
+                    for n in cutlass.range_constexpr(block_n):
+                        norm = cute.arch.shuffle_sync(
+                            rNorm[n // 32], n % 32)
+                        score = norm - fragB[n]
+                        take = score < best_s
+                        best_s = cutlass.select_(take, score, best_s)
+                        best_i = cutlass.select_(
+                            take, cutlass.Int32(baseB + n), best_i)
+
+                if tidx < block_n:
+                    mOut[bidx * BLOCK_M + tidx] = best_i
+
+            cute.arch.sync_threads()
+            tmem.free(pool.base_ptr)
+
+    class BlackwellFlashKmeansAssignWSILP2(BlackwellFlashKmeansAssignWS):
+        """WS pipeline with two independent argmin dependency chains."""
+
+        @cute.jit
+        def _consume_tile_argmin(self, best_s, best_i, frag, sCsq, base,
+                                 BN: cutlass.Constexpr):
+            s0, s1 = cutlass.Float32(INF), cutlass.Float32(INF)
+            i0, i1 = cutlass.Int32(-1), cutlass.Int32(-1)
+            for q in cutlass.range_constexpr(BN // 2):
+                n0, n1 = 2 * q, 2 * q + 1
+                v0, v1 = sCsq[n0] - frag[n0], sCsq[n1] - frag[n1]
+                take0, take1 = v0 < s0, v1 < s1
+                s0 = cutlass.select_(take0, v0, s0)
+                s1 = cutlass.select_(take1, v1, s1)
+                i0 = cutlass.select_(take0, cutlass.Int32(base + n0), i0)
+                i1 = cutlass.select_(take1, cutlass.Int32(base + n1), i1)
+            for val, idx in ((s0, i0), (s1, i1)):
+                take = (val < best_s) | ((val == best_s) & (idx < best_i))
+                best_s = cutlass.select_(take, val, best_s)
+                best_i = cutlass.select_(take, idx, best_i)
+            return best_s, best_i
 
 
     class BlackwellFlashKmeansAssignStream:
@@ -2183,6 +2474,8 @@ def _pick_variant(N: int, D: int, K: int, block_n: int) -> str:
     if block_n >= 128 and n_db_tiles % 2 == 0 and n_db_tiles >= 2:
         if D >= 256:
             return "ws"
+        if D == 128:
+            return "ws_norm_broadcast"
         if N <= 262144:
             return "ws"
     return "xres"
@@ -2275,7 +2568,8 @@ def blackwell_assign_euclid(
             "xres": BlackwellFlashKmeansAssignXResident,
             "dual": BlackwellFlashKmeansAssignDual,
             "paired": BlackwellFlashKmeansAssignPaired,
-            "ws": BlackwellFlashKmeansAssignWS,
+            "ws": BlackwellFlashKmeansAssignWSILP2,
+            "ws_norm_broadcast": BlackwellFlashKmeansAssignWSNormBroadcast,
             "stream": BlackwellFlashKmeansAssignStream,
             "base": BlackwellFlashKmeansAssign,
         }[variant]
